@@ -16,7 +16,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
-from agentscope_runtime.engine.schemas.exception import (
+from qwenpaw.exceptions import (
     AppBaseException,
 )
 
@@ -35,8 +35,10 @@ router = APIRouter(prefix="/models", tags=["models"])
 
 ChatModelName = Literal[
     "OpenAIChatModel",
+    "OpenAIResponseModel",
     "AnthropicChatModel",
     "GeminiChatModel",
+    "DashScopeChatModel",
 ]
 
 # effective: agent-specific if set, otherwise global
@@ -53,6 +55,24 @@ async def get_provider_manager(request: Request) -> ProviderManager:
         request: FastAPI request object
     """
     return request.app.state.provider_manager
+
+
+def _active_models_info(
+    manager: ProviderManager,
+    active_llm: ModelSlotConfig | None,
+) -> ActiveModelsInfo:
+    """Build active-model metadata using the runtime context resolver."""
+    effective_max_input_length = None
+    if active_llm and active_llm.provider_id and active_llm.model:
+        provider = manager.get_provider(active_llm.provider_id)
+        if provider is not None:
+            effective_max_input_length = provider.get_context_size(
+                active_llm.model,
+            )
+    return ActiveModelsInfo(
+        active_llm=active_llm,
+        effective_max_input_length=effective_max_input_length,
+    )
 
 
 class ProviderConfigRequest(BaseModel):
@@ -145,6 +165,22 @@ class ModelConfigRequest(BaseModel):
             "Per-model generation parameters in JSON format. "
             "These override provider-level generate_kwargs."
         ),
+    )
+    relay_reasoning: Optional[bool] = Field(
+        default=None,
+        description="Whether to relay reasoning_content in subsequent turns.",
+    )
+    thinking_enabled: Optional[bool] = Field(
+        default=None,
+        description="Enable/disable thinking for this model.",
+    )
+    thinking_budget: Optional[int] = Field(
+        default=None,
+        description="Token budget for thinking.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Reasoning effort level (low/medium/high).",
     )
 
 
@@ -573,6 +609,10 @@ async def configure_model(
                 "generate_kwargs": body.generate_kwargs,
                 "max_tokens": body.max_tokens,
                 "max_input_length": body.max_input_length,
+                "relay_reasoning": body.relay_reasoning,
+                "thinking_enabled": body.thinking_enabled,
+                "thinking_budget": body.thinking_budget,
+                "reasoning_effort": body.reasoning_effort,
             },
         )
     except (ValueError, AppBaseException) as exc:
@@ -598,7 +638,7 @@ async def get_active_models(
     - agent: a specific agent's configured model only
     """
     if scope == "global":
-        return ActiveModelsInfo(active_llm=manager.get_active_model())
+        return _active_models_info(manager, manager.get_active_model())
 
     if scope == "agent":
         if not agent_id:
@@ -606,8 +646,9 @@ async def get_active_models(
                 status_code=400,
                 detail="agent_id is required when scope is 'agent'",
             )
-        return ActiveModelsInfo(
-            active_llm=await _load_agent_model(request, agent_id),
+        return _active_models_info(
+            manager,
+            await _load_agent_model(request, agent_id),
         )
 
     try:
@@ -623,7 +664,7 @@ async def get_active_models(
                 target_agent_id,
                 agent_model,
             )
-            return ActiveModelsInfo(active_llm=agent_model)
+            return _active_models_info(manager, agent_model)
     except (
         HTTPException,
         OSError,
@@ -639,7 +680,7 @@ async def get_active_models(
 
     global_model = manager.get_active_model()
     logger.info("Returning global model: %s", global_model)
-    return ActiveModelsInfo(active_llm=global_model)
+    return _active_models_info(manager, global_model)
 
 
 @router.put(
@@ -685,7 +726,7 @@ async def set_active_model(
         except Exception:
             pass
 
-        return ActiveModelsInfo(active_llm=manager.get_active_model())
+        return _active_models_info(manager, manager.get_active_model())
 
     if not body.agent_id:
         raise HTTPException(
@@ -728,8 +769,9 @@ async def set_active_model(
 
     manager.maybe_probe_multimodal(body.provider_id, body.model)
 
-    return ActiveModelsInfo(
-        active_llm=ModelSlotConfig(
+    return _active_models_info(
+        manager,
+        ModelSlotConfig(
             provider_id=body.provider_id,
             model=body.model,
         ),

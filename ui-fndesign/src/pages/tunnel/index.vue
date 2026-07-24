@@ -2,15 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 
 const APP_NAME = 'com.dustinky.qwenpaw'
-const API_BASE = '/cgi/ThirdParty/com.dustinky.tunnel/api.cgi'
-
-const getDefaultService = (): string => {
-  if (typeof window !== 'undefined') {
-    const hostname = window.location.hostname
-    return `http://${hostname}:19091`
-  }
-  return 'http://localhost:19091'
-}
+const API_BASE = '/cgi/ThirdParty/com.dustinky.qwenpaw/api.cgi'
 
 const toast = useToast()
 const showNotification = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info') => {
@@ -29,6 +21,38 @@ const showNotification = (message: string, type: 'success' | 'error' | 'warning'
         ? 'i-lucide-check-circle'
         : 'i-lucide-info'
   toast.add({ title: message, color, icon })
+}
+
+const tunnelInstalled = ref<boolean | null>(null)
+const isCheckingInstall = ref(false)
+
+const getDefaultService = (): string => {
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname
+    return `http://${hostname}:19091`
+  }
+  return 'http://localhost:19091'
+}
+
+const checkTunnelInstalled = async () => {
+  isCheckingInstall.value = true
+  try {
+    const res = await fetch(`${API_BASE}?action=check_tunnel`)
+    const result = await res.json()
+    if (result.success) {
+      tunnelInstalled.value = result.installed
+    } else {
+      tunnelInstalled.value = false
+    }
+  } catch {
+    tunnelInstalled.value = false
+  } finally {
+    isCheckingInstall.value = false
+  }
+}
+
+const refreshInstallStatus = () => {
+  checkTunnelInstalled()
 }
 
 // Tunnel 状态
@@ -104,10 +128,14 @@ const domainStatusIcon = computed(() => {
   return domainStatus.value.dnsValid && domainStatus.value.ingressValid ? 'i-lucide-check-circle' : 'i-lucide-alert-triangle'
 })
 
+const TUNNEL_API_BASE = '/cgi/ThirdParty/com.dustinky.tunnel/api.cgi'
+
 const fetchTunnelStatus = async () => {
+  if (!tunnelInstalled.value) return
+  
   isLoadingTunnel.value = true
   try {
-    const res = await fetch(`${API_BASE}?action=status`)
+    const res = await fetch(`${TUNNEL_API_BASE}?action=status`)
     const result = await res.json()
     if (result.success) {
       tunnelStatus.value = result
@@ -123,9 +151,11 @@ const fetchTunnelStatus = async () => {
 }
 
 const fetchDomainStatus = async () => {
+  if (!tunnelInstalled.value) return
+  
   isLoadingDomain.value = true
   try {
-    const res = await fetch(`${API_BASE}?action=get_app_domain_status&appName=${APP_NAME}`)
+    const res = await fetch(`${TUNNEL_API_BASE}?action=get_app_domain_status&appName=${APP_NAME}`)
     const result = await res.json()
     if (result.success) {
       domainStatus.value = result
@@ -147,6 +177,11 @@ const fetchDomainStatus = async () => {
 }
 
 const registerDomain = async () => {
+  if (!tunnelInstalled.value) {
+    showNotification('请先安装 Cloudflare Tunnel 应用', 'warning')
+    return
+  }
+  
   if (!domain.value.trim()) {
     showNotification('请输入域名', 'warning')
     return
@@ -162,7 +197,7 @@ const registerDomain = async () => {
 
   isRegistering.value = true
   try {
-    const res = await fetch(`${API_BASE}?action=register_app_domain`, {
+    const res = await fetch(`${TUNNEL_API_BASE}?action=register_app_domain`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -187,34 +222,110 @@ const registerDomain = async () => {
 }
 
 const refreshAll = async () => {
+  if (!tunnelInstalled.value) {
+    await checkTunnelInstalled()
+    if (!tunnelInstalled.value) {
+      showNotification('Cloudflare Tunnel 未安装', 'warning')
+      return
+    }
+  }
   await Promise.all([fetchTunnelStatus(), fetchDomainStatus()])
   showNotification('已刷新', 'success')
 }
 
-onMounted(() => {
-  refreshAll()
+onMounted(async () => {
+  await checkTunnelInstalled()
+  if (tunnelInstalled.value) {
+    await refreshAll()
+  }
 })
 </script>
 
 <template>
   <div class="mx-auto space-y-6">
-    <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-      <div>
-        <h1 class="text-3xl font-bold text-[var(--ui-text)]">
-          外网访问
-        </h1>
-        <p class="text-[var(--ui-text-muted)] mt-2">
-          通过 Cloudflare Tunnel 将 QwenPaw 暴露到公网，实现外网域名访问
-        </p>
+    <!-- 加载中 -->
+    <div v-if="isCheckingInstall" class="flex flex-col items-center justify-center py-20">
+      <UIcon name="i-lucide-loader" class="w-10 h-10 animate-spin text-[var(--ui-text-muted)]" />
+      <p class="mt-4 text-[var(--ui-text-muted)]">检查 Cloudflare Tunnel 应用...</p>
+    </div>
+
+    <!-- 未安装引导页面 -->
+    <div v-else-if="tunnelInstalled === false" class="flex flex-col items-center justify-center py-20">
+      <div class="w-24 h-24 rounded-full bg-amber-100 dark:bg-amber-500/20 flex items-center justify-center mb-6">
+        <UIcon name="i-lucide-cloud-off" class="w-12 h-12 text-amber-500" />
       </div>
-      <UButton
-        icon="i-lucide-refresh-cw"
-        variant="outline"
-        @click="refreshAll"
-      >
-        刷新
+      <h2 class="text-2xl font-bold text-[var(--ui-text)] mb-3">
+        Cloudflare Tunnel 未安装
+      </h2>
+      <p class="text-[var(--ui-text-muted)] text-center max-w-md mb-8">
+        要使用外网访问功能，您需要先在飞牛应用商店安装 Cloudflare Tunnel 应用。
+        安装后，QwenPaw 可以通过 Cloudflare Tunnel 将服务暴露到公网。
+      </p>
+      
+      <UCard class="w-full max-w-lg bg-[var(--ui-bg-card)] shadow-sm mb-6">
+        <div class="p-6">
+          <h3 class="text-lg font-semibold text-[var(--ui-text)] mb-4">
+            <UIcon name="i-lucide-list" class="w-5 h-5 inline-block mr-2" />
+            安装步骤
+          </h3>
+          <ol class="space-y-4">
+            <li class="flex items-start gap-3">
+              <span class="flex-shrink-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center text-sm font-medium">1</span>
+              <div>
+                <p class="text-[var(--ui-text)]">打开飞牛应用商店</p>
+                <p class="text-sm text-[var(--ui-text-muted)]">在应用中心搜索 "Cloudflare Tunnel"</p>
+              </div>
+            </li>
+            <li class="flex items-start gap-3">
+              <span class="flex-shrink-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center text-sm font-medium">2</span>
+              <div>
+                <p class="text-[var(--ui-text)]">安装 Cloudflare Tunnel 应用</p>
+                <p class="text-sm text-[var(--ui-text-muted)]">点击安装按钮，等待应用安装完成</p>
+              </div>
+            </li>
+            <li class="flex items-start gap-3">
+              <span class="flex-shrink-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center text-sm font-medium">3</span>
+              <div>
+                <p class="text-[var(--ui-text)]">配置 Cloudflare 账号</p>
+                <p class="text-sm text-[var(--ui-text-muted)]">安装完成后，按照应用指引配置您的 Cloudflare 账号</p>
+              </div>
+            </li>
+            <li class="flex items-start gap-3">
+              <span class="flex-shrink-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center text-sm font-medium">4</span>
+              <div>
+                <p class="text-[var(--ui-text)]">返回此页面</p>
+                <p class="text-sm text-[var(--ui-text-muted)]">配置完成后，点击下方按钮刷新状态</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </UCard>
+
+      <UButton color="primary" size="lg" @click="refreshInstallStatus">
+        <UIcon name="i-lucide-refresh-cw" class="w-4 h-4 mr-2" />
+        我已安装，刷新状态
       </UButton>
     </div>
+
+    <!-- 已安装的正常页面 -->
+    <template v-else-if="tunnelInstalled === true">
+      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h1 class="text-3xl font-bold text-[var(--ui-text)]">
+            外网访问
+          </h1>
+          <p class="text-[var(--ui-text-muted)] mt-2">
+            通过 Cloudflare Tunnel 将 QwenPaw 暴露到公网，实现外网域名访问
+          </p>
+        </div>
+        <UButton
+          icon="i-lucide-refresh-cw"
+          variant="outline"
+          @click="refreshAll"
+        >
+          刷新
+        </UButton>
+      </div>
 
     <!-- Tunnel 状态卡片 -->
     <UCard
@@ -386,5 +497,6 @@ onMounted(() => {
         </div>
       </div>
     </UCard>
+    </template>
   </div>
 </template>

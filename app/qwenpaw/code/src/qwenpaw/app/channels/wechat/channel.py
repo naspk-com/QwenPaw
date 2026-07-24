@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import base64 as _b64
 
-from agentscope_runtime.engine.schemas.agent_schemas import (
+from qwenpaw.schemas import (
     AgentRequest,
     FileContent,
     ImageContent,
@@ -39,6 +39,7 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
 
 from ....exceptions import ChannelError
 from ....constant import DEFAULT_MEDIA_DIR, WORKING_DIR
+from ..renderer import ChannelDisplayConfig
 from ..base import (
     BaseChannel,
     ContentType,
@@ -82,9 +83,8 @@ class WeChatChannel(BaseChannel):
         media_dir: str = "",
         workspace_dir: Path | None = None,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
+        no_text_debounce: bool = True,
         dm_policy: str = "open",
         group_policy: str = "open",
         allow_from: Optional[List[str]] = None,
@@ -97,9 +97,8 @@ class WeChatChannel(BaseChannel):
         super().__init__(
             process,
             on_reply_sent=on_reply_sent,
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=display_config,
+            no_text_debounce=no_text_debounce,
             dm_policy=dm_policy,
             group_policy=group_policy,
             allow_from=allow_from,
@@ -249,9 +248,8 @@ class WeChatChannel(BaseChannel):
         process: ProcessHandler,
         config: Any,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
+        no_text_debounce: bool = True,
         workspace_dir: Path | None = None,
     ) -> "WeChatChannel":
         return cls(
@@ -264,9 +262,9 @@ class WeChatChannel(BaseChannel):
             media_dir=getattr(config, "media_dir", None) or "",
             workspace_dir=workspace_dir,
             on_reply_sent=on_reply_sent,
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=display_config
+            or ChannelDisplayConfig.from_config(config),
+            no_text_debounce=no_text_debounce,
             dm_policy=getattr(config, "dm_policy", "open") or "open",
             group_policy=getattr(config, "group_policy", "open") or "open",
             allow_from=getattr(config, "allow_from", []) or [],

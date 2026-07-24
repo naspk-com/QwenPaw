@@ -4,14 +4,14 @@
 
 A lightweight channel that prints all agent responses to stdout.
 
-Messages are sent to the agent via the standard AgentApp ``/agent/process``
-endpoint or via POST /console/chat. This channel handles the **output** side:
-whenever a completed message event or a proactive send arrives, it is
-pretty-printed to the terminal.
+Messages are sent to the agent via POST /api/console/chat. This channel
+handles the **output** side: whenever a completed message event or a
+proactive send arrives, it is pretty-printed to the terminal.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json as _json
 import logging
@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
-from agentscope_runtime.engine.schemas.agent_schemas import (
+from qwenpaw.schemas import (
     MessageType,
     Message,
     RunStatus,
@@ -31,6 +31,7 @@ from ....config.config import ConsoleConfig as ConsoleChannelConfig
 from ...console_push_store import append as push_store_append
 from ....constant import DEFAULT_MEDIA_DIR
 from ....exceptions import ModelQuotaExceededException
+from ..renderer import ChannelDisplayConfig
 from ..base import (
     BaseChannel,
     AudioContent,
@@ -65,13 +66,11 @@ def _ts() -> str:
 class ConsoleChannel(BaseChannel):
     """Console Channel: prints agent responses to stdout.
 
-    Input is handled by AgentApp's ``/agent/process`` endpoint; this
-    channel only takes care of output (printing to the terminal).
+    Input is handled by ``POST /api/console/chat``; this channel only
+    takes care of output (printing to the terminal).
 
     Supports filtering options via config:
-        - show_tool_details: Display tool execution details
-        - filter_tool_messages: Hide intermediate tool messages
-        - filter_thinking: Hide agent thinking/reasoning blocks
+        - display_config: Control thinking and tool message presentation
     """
 
     channel = "console"
@@ -82,9 +81,7 @@ class ConsoleChannel(BaseChannel):
         enabled: bool,
         bot_prefix: str,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
         workspace_dir: Optional[Union[str, Path]] = None,
         media_dir: Optional[str] = None,
     ):
@@ -95,9 +92,7 @@ class ConsoleChannel(BaseChannel):
             enabled: Whether this channel is active.
             bot_prefix: Prefix string for bot messages.
             on_reply_sent: Callback when reply is sent.
-            show_tool_details: Whether to show tool execution details.
-            filter_tool_messages: Whether to filter out tool messages.
-            filter_thinking: Whether to filter thinking/reasoning blocks.
+            display_config: Thinking and tool display settings.
             workspace_dir: Agent workspace directory; used to resolve uploaded
                 file names (media_dir = workspace_dir / "media").
             media_dir: Agent workspace directory for resolving uploads.
@@ -105,9 +100,7 @@ class ConsoleChannel(BaseChannel):
         super().__init__(
             process,
             on_reply_sent=on_reply_sent,
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=display_config,
         )
         self.enabled = enabled
         self.bot_prefix = bot_prefix
@@ -160,9 +153,8 @@ class ConsoleChannel(BaseChannel):
         process: ProcessHandler,
         config: ConsoleChannelConfig,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
+        no_text_debounce: bool = True,
         workspace_dir: Optional[Union[str, Path]] = None,
     ) -> "ConsoleChannel":
         """Create ConsoleChannel from config.
@@ -171,9 +163,7 @@ class ConsoleChannel(BaseChannel):
             process: Handler for agent requests.
             config: Console channel configuration.
             on_reply_sent: Callback when reply is sent.
-            show_tool_details: Whether to show tool execution details.
-            filter_tool_messages: Whether to filter out tool messages.
-            filter_thinking: Whether to filter thinking/reasoning blocks.
+            display_config: Thinking and tool display settings.
             workspace_dir: Agent workspace directory for resolving uploads.
 
         Returns:
@@ -184,9 +174,8 @@ class ConsoleChannel(BaseChannel):
             enabled=config.enabled,
             bot_prefix=config.bot_prefix or "",
             on_reply_sent=on_reply_sent,
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=display_config
+            or ChannelDisplayConfig.from_config(config),
             workspace_dir=workspace_dir,
             media_dir=config.media_dir or "",
         )
@@ -275,6 +264,12 @@ class ConsoleChannel(BaseChannel):
             channel_meta=meta,
         )
         request.channel_meta = meta
+        rc = meta.get("request_context")
+        if isinstance(rc, dict) and rc:
+            request.request_context = rc
+        mso = payload.get("model_slot_override")
+        if mso is not None:
+            request.model_slot_override = mso
         return request
 
     async def _extract_media_message(self, message: Message) -> Message | None:
@@ -315,21 +310,47 @@ class ConsoleChannel(BaseChannel):
                     type=MessageType.MESSAGE,
                     role="assistant",
                     content=new_parts,
+                    status=RunStatus.Completed,
                 )
+                media_message.object = "message"
         return media_message
 
-    def _extract_token_usage(
+    def _on_turn_usage_ready(
         self,
-        session_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        from ....token_usage import TokenRecordingModelWrapper
+        turn: Optional[Dict[str, Any]],
+        ctx: Optional[Dict[str, Any]],
+    ) -> None:
+        """Print a one-line terminal summary when per-turn usage is staged.
 
-        if not session_id:
-            return None
+        The shared SSE block is built by ``BaseChannel`` — the console only
+        adds the terminal status line on top of it.
+        """
+        if turn and ctx:
+            self._print_status_line(turn, ctx)
 
-        usage = TokenRecordingModelWrapper.pop_usage_for_session(session_id)
-        logger.info("Usage for session %s (cleaned up): %s", session_id, usage)
-        return usage
+    def _print_status_line(
+        self,
+        turn: Dict[str, Any],
+        ctx: Dict[str, Any],
+    ) -> None:
+        """Print a one-line terminal summary of turn + context usage."""
+        from ....token_usage import fmt_tokens
+
+        pt = turn.get("prompt_tokens", 0)
+        ct = turn.get("completion_tokens", 0)
+        tt = turn.get("total_tokens", 0)
+        est = int(ctx.get("estimated_tokens", 0) or 0)
+        mx = int(ctx.get("max_input_length", 0) or 0)
+        ratio = ctx.get("context_usage_ratio", 0) or 0
+        turn_line = (
+            f"{_GREEN}Turn {_BOLD}{fmt_tokens(tt)}{_RESET} "
+            f"(in {fmt_tokens(pt)} · out {fmt_tokens(ct)})"
+        )
+        ctx_line = (
+            f" · Context {_BOLD}{fmt_tokens(est)}{_RESET} / "
+            f"{fmt_tokens(mx)} ({ratio:.1f}%)"
+        )
+        self._safe_print(f"📝 {turn_line}{ctx_line}")
 
     async def stream_one(self, payload: Any) -> AsyncGenerator[str, None]:
         """Process one payload and yield SSE-formatted events"""
@@ -362,6 +383,33 @@ class ConsoleChannel(BaseChannel):
                     return
                 if merged and hasattr(request.input[0], "content"):
                     request.input[0].content = merged
+        session_id = getattr(request, "session_id", "") or session_id
+        self._clear_session_turn_usage(session_id)
+        user_id = getattr(request, "user_id", "") or ""
+        channel_name = getattr(request, "channel", "") or self.channel
+
+        # Refresh the chat's updated_at so the console session list surfaces
+        # this new message as the latest activity (issue #6131). stream_one is
+        # the single console executor for the web streaming, background-task,
+        # and terminal CLI paths, so touching here covers them all. We only
+        # touch an already-existing chat (never create one) to preserve the
+        # current behavior for sessions that have no ChatSpec yet.
+        if self._workspace is not None and session_id:
+            try:
+                chat_mgr = getattr(self._workspace, "chat_manager", None)
+                if chat_mgr is not None:
+                    await chat_mgr.touch_chat_by_session(
+                        session_id=session_id,
+                        channel=channel_name,
+                        user_id=user_id or None,
+                    )
+            except Exception:  # pylint: disable=broad-except
+                logger.debug(
+                    "failed to touch chat updated_at for session=%s",
+                    session_id[:30],
+                    exc_info=True,
+                )
+
         try:
             send_meta = getattr(request, "channel_meta", None) or {}
             send_meta.setdefault("bot_prefix", self.bot_prefix)
@@ -392,11 +440,6 @@ class ConsoleChannel(BaseChannel):
                         for message in event_output:
                             event.output.append(message)
 
-                if obj == "response":
-                    usage_data = self._extract_token_usage(session_id)
-                    if usage_data and hasattr(event, "usage"):
-                        setattr(event, "usage", usage_data)
-
                 data = self._serialize_event_for_sse(event)
                 yield f"data: {data}\n\n"
 
@@ -407,15 +450,23 @@ class ConsoleChannel(BaseChannel):
                 elif obj == "response":
                     last_response = event
 
+            err_msg = self._get_response_error_message(last_response)
+            if err_msg:
+                self._clear_session_turn_usage(session_id)
+                self._print_error(err_msg)
+            else:
+                for sse in await self._commit_turn_usage(
+                    request,
+                    session_id,
+                    emit_sse=True,
+                ):
+                    yield sse
+
             logger.info(
                 "console stream done: event_count=%s has_response=%s",
                 event_count,
                 last_response is not None,
             )
-
-            err_msg = self._get_response_error_message(last_response)
-            if err_msg:
-                self._print_error(err_msg)
 
             to_handle = request.user_id or ""
             if self._on_reply_sent:
@@ -425,7 +476,11 @@ class ConsoleChannel(BaseChannel):
                     request.session_id or f"{self.channel}:{to_handle}",
                 )
 
+        except asyncio.CancelledError:
+            self._clear_session_turn_usage(session_id)
+            raise
         except ModelQuotaExceededException as e:
+            self._clear_session_turn_usage(session_id)
             logger.warning("rate limit hit: %s", e)
             alternatives = self._get_free_model_alternatives()
             rl_event = _json.dumps(
@@ -438,6 +493,7 @@ class ConsoleChannel(BaseChannel):
             yield f"data: {rl_event}\n\n"
             self._print_error(str(e).strip())
         except Exception as e:
+            self._clear_session_turn_usage(session_id)
             logger.exception("console process/reply failed")
             err_msg = str(e).strip() or "An error occurred while processing."
             self._print_error(err_msg)

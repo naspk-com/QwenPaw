@@ -32,7 +32,7 @@ from typing import Any, AsyncGenerator
 
 from agentscope.model import ChatModelBase
 from agentscope.model._model_response import ChatResponse
-from agentscope_runtime.engine.schemas.exception import (
+from qwenpaw.exceptions import (
     RateLimitExceededException,
 )
 
@@ -106,10 +106,15 @@ def _get_openai_retryable() -> tuple[type[Exception], ...]:
         try:
             import openai
 
-            _openai_retryable = (
-                openai.RateLimitError,
-                openai.APITimeoutError,
-                openai.APIConnectionError,
+            _openai_retryable = tuple(
+                cls
+                for cls in (
+                    openai.RateLimitError,
+                    openai.APITimeoutError,
+                    openai.APIConnectionError,
+                    getattr(openai, "InternalServerError", None),
+                )
+                if cls is not None
             )
         except ImportError:
             _openai_retryable = ()
@@ -147,6 +152,40 @@ def _get_httpx_retryable() -> tuple[type[Exception], ...]:
     return _httpx_retryable
 
 
+def _extract_status_code(exc: Exception) -> int | None:
+    """Best-effort HTTP status extraction from SDK exceptions.
+
+    Streaming SSE errors are raised as plain ``openai.APIError`` without a
+    ``status_code`` attribute; the gateway status is often only present in
+    ``body`` (e.g. ``{"status_code": 502, "error": {...}}``).
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            pass
+
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return None
+
+    for container in (body, body.get("error")):
+        if not isinstance(container, dict):
+            continue
+        raw = container.get("status_code")
+        if raw is None:
+            raw = container.get("code")
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
 def _is_retryable(exc: Exception) -> bool:
     """Return *True* if *exc* should trigger a retry."""
     retryable = (
@@ -157,7 +196,7 @@ def _is_retryable(exc: Exception) -> bool:
     if retryable and isinstance(exc, retryable):
         return True
 
-    status = getattr(exc, "status_code", None)
+    status = _extract_status_code(exc)
     if status is not None and status in RETRYABLE_STATUS_CODES:
         return True
 
@@ -166,7 +205,7 @@ def _is_retryable(exc: Exception) -> bool:
 
 def _is_rate_limit(exc: Exception) -> bool:
     """Return *True* if *exc* is specifically a 429 rate-limit error."""
-    return getattr(exc, "status_code", None) == 429
+    return _extract_status_code(exc) == 429
 
 
 def _is_missing_reasoning_content_error(exc: Exception) -> bool:
@@ -177,7 +216,7 @@ def _is_missing_reasoning_content_error(exc: Exception) -> bool:
     conversation history was produced by a non-reasoning model, these
     fields are absent and the API rejects the request with a 400.
     """
-    if getattr(exc, "status_code", None) != 400:
+    if _extract_status_code(exc) != 400:
         return False
     return "reasoning_content" in str(exc)
 
@@ -294,7 +333,17 @@ class RetryChatModel(ChatModelBase):
         retry_config: RetryConfig | None = None,
         rate_limit_config: RateLimitConfig | None = None,
     ) -> None:
-        super().__init__(model_name=inner.model_name, stream=inner.stream)
+        # agentscope 2.0 ChatModelBase requires credential/model/parameters;
+        # forward the inner wrapper's own values so attribute access stays
+        # transparent.
+        super().__init__(
+            credential=getattr(inner, "credential", None),
+            model=getattr(inner, "model", "unknown"),
+            parameters=getattr(inner, "parameters", None)
+            or ChatModelBase.Parameters(),
+            stream=getattr(inner, "stream", True),
+            context_size=getattr(inner, "context_size", 32768),
+        )
         self._inner = inner
         self._retry_config = _normalize_retry_config(retry_config)
         self._rate_limit_config = _normalize_rate_limit_config(
@@ -311,7 +360,7 @@ class RetryChatModel(ChatModelBase):
     def model_key(self) -> str:
         """Stable key for the underlying model: ``provider_id:model_name``."""
         provider_id = getattr(self._inner, "_provider_id", None)
-        name = self._inner.model_name
+        name = self._inner.model
         return f"{provider_id}:{name}" if provider_id else name
 
     @staticmethod
@@ -381,6 +430,13 @@ class RetryChatModel(ChatModelBase):
                 # Stream failed before producing any chunk;
                 # slot not yet released.
                 limiter.release()
+
+    async def generate_structured_output(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._inner.generate_structured_output(*args, **kwargs)
 
     async def __call__(
         self,
@@ -520,110 +576,90 @@ class RetryChatModel(ChatModelBase):
                 ``on_success()`` so stale pauses are cleared but fresh ones
                 (set by a concurrent 429 after this call acquired) are kept.
         """
-        try:
-            async for chunk in self._consume_stream_with_slot(
-                stream,
-                limiter,
-                acquired_at,
-            ):
-                yield chunk
-            return  # stream completed without error
-        except Exception as failed_exc:
-            if _is_retryable(failed_exc) and _is_rate_limit(failed_exc):
-                await limiter.report_rate_limit(
-                    _extract_retry_after(failed_exc),
-                )
+        attempt = current_attempt
+        pending_stream: AsyncGenerator[ChatResponse, None] | None = stream
+        pending_acquired_at = acquired_at
+        reasoning_injected = False
 
-            if (
-                not _is_retryable(failed_exc)
-                or current_attempt >= max_attempts
-            ):
-                raise failed_exc
-
-            delay = _compute_backoff(current_attempt, self._retry_config)
-            logger.warning(
-                "LLM stream failed (attempt %d/%d): %s. Retrying in %.1fs ...",
-                current_attempt,
-                max_attempts,
-                failed_exc,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
-        # Retry loop for stream failures
-        for attempt in range(current_attempt + 1, max_attempts + 1):
-            acquired = False
-            owns_semaphore = True
-            retry_acquired_at: float = 0.0
+        while True:
             try:
+                if pending_stream is not None:
+                    async for chunk in self._consume_stream_with_slot(
+                        pending_stream,
+                        limiter,
+                        pending_acquired_at,
+                    ):
+                        yield chunk
+                    return  # stream completed without error
+
+                acquired = False
+                owns_semaphore = True
+                retry_acquired_at: float = 0.0
                 try:
-                    retry_acquired_at = await asyncio.wait_for(
-                        limiter.acquire(),
-                        timeout=self._rate_limit_config.acquire_timeout,
-                    )
-                    acquired = True
-                except asyncio.TimeoutError as exc:
-                    raise _AcquireTimeoutError(
-                        operation="LLM execution (stream retry)",
-                        retry_after=int(
-                            self._rate_limit_config.acquire_timeout,
-                        ),
-                        details={
-                            "reason": "Timed out waiting for execution slot",
-                        },
-                    ) from exc
-
-                result = await self._inner(*call_args, **call_kwargs)
-
-                if isinstance(result, AsyncGenerator):
-                    owns_semaphore = False
                     try:
-                        async for chunk in self._consume_stream_with_slot(
-                            result,
-                            limiter,
-                            retry_acquired_at,
-                        ):
-                            yield chunk
-                        return  # stream completed without error
-                    except Exception as retry_failed:
-                        if _is_retryable(retry_failed) and _is_rate_limit(
-                            retry_failed,
-                        ):
-                            await limiter.report_rate_limit(
-                                _extract_retry_after(retry_failed),
-                            )
-                        if (
-                            not _is_retryable(retry_failed)
-                            or attempt >= max_attempts
-                        ):
-                            raise retry_failed
-                        retry_delay = _compute_backoff(
-                            attempt,
-                            self._retry_config,
+                        retry_acquired_at = await asyncio.wait_for(
+                            limiter.acquire(),
+                            timeout=self._rate_limit_config.acquire_timeout,
                         )
-                        logger.warning(
-                            "LLM stream retry failed (attempt %d/%d): %s. "
-                            "Retrying in %.1fs ...",
-                            attempt,
-                            max_attempts,
-                            retry_failed,
-                            retry_delay,
-                        )
-                        await asyncio.sleep(retry_delay)
-                else:
+                        acquired = True
+                    except asyncio.TimeoutError as exc:
+                        raise _AcquireTimeoutError(
+                            operation="LLM execution (stream retry)",
+                            retry_after=int(
+                                self._rate_limit_config.acquire_timeout,
+                            ),
+                            details={
+                                "reason": (
+                                    "Timed out waiting for execution slot"
+                                ),
+                            },
+                        ) from exc
+
+                    result = await self._inner(*call_args, **call_kwargs)
+
+                    if isinstance(result, AsyncGenerator):
+                        owns_semaphore = False
+                        pending_stream = result
+                        pending_acquired_at = retry_acquired_at
+                        continue
+
                     yield result
                     return
+                finally:
+                    if owns_semaphore and acquired:
+                        limiter.release()
 
             except Exception as retry_exc:
+                pending_stream = None
+                if (
+                    not reasoning_injected
+                    and _is_missing_reasoning_content_error(retry_exc)
+                    and _inject_reasoning_content(call_args, call_kwargs)
+                ):
+                    reasoning_injected = True
+                    get_capability_cache().learn(
+                        self.model_key,
+                        "needs_reasoning_content",
+                        True,
+                    )
+                    logger.warning(
+                        "Thinking-mode stream requires reasoning_content "
+                        "on every assistant message. Injecting empty "
+                        "values and retrying (learned for future calls).",
+                    )
+                    continue
+
                 if _is_retryable(retry_exc) and _is_rate_limit(retry_exc):
                     await limiter.report_rate_limit(
                         _extract_retry_after(retry_exc),
                     )
+
                 if not _is_retryable(retry_exc) or attempt >= max_attempts:
                     raise
+
                 retry_delay = _compute_backoff(attempt, self._retry_config)
                 logger.warning(
-                    "LLM stream retry failed (attempt %d/%d): %s. "
+                    "LLM stream failed (attempt %d/%d): %s. "
                     "Retrying in %.1fs ...",
                     attempt,
                     max_attempts,
@@ -631,7 +667,4 @@ class RetryChatModel(ChatModelBase):
                     retry_delay,
                 )
                 await asyncio.sleep(retry_delay)
-
-            finally:
-                if owns_semaphore and acquired:
-                    limiter.release()
+                attempt += 1

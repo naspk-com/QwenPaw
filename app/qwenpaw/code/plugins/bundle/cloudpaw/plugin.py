@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=protected-access
 """CloudPaw Plugin for QwenPaw.
 
 Provides Alibaba Cloud deployment orchestration capabilities:
@@ -180,18 +181,6 @@ def _init_a2a_manager() -> None:
         logger.info("A2A client manager initialized")
     except Exception as e:
         logger.warning("Failed to initialize A2A client manager: %s", e)
-
-
-def _register_a2a_command() -> None:
-    """Register /a2a as a control command."""
-    try:
-        from qwenpaw.app.runner.control_commands import register_command
-        from .tools.a2a_command import A2AListCommandHandler
-
-        register_command(A2AListCommandHandler())
-        logger.info("Registered /a2a control command")
-    except Exception as e:
-        logger.warning("Failed to register /a2a command: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +434,10 @@ def _patch_plugin_loader_unload() -> None:
         )
         return
 
+    if getattr(PluginLoader.unload_plugin, "_cloudpaw_patched", False):
+        logger.debug("unload_plugin already patched; skip")
+        return
+
     _original_unload_plugin = PluginLoader.unload_plugin
 
     async def _patched_unload_plugin(
@@ -469,6 +462,8 @@ def _patch_plugin_loader_unload() -> None:
 
         return await _original_unload_plugin(self, plugin_id, delete_files)
 
+    _patched_unload_plugin._cloudpaw_patched = True
+    _patched_unload_plugin._original = _original_unload_plugin
     PluginLoader.unload_plugin = _patched_unload_plugin
     logger.info("[CloudPaw] Patched PluginLoader.unload_plugin")
 
@@ -521,6 +516,20 @@ class CloudPawPlugin:
                 exc_info=True,
             )
 
+        # Register A2A mode via official PluginApi.
+        # This registers /a2a as a slash command via SlashCommandRegistry.
+        try:
+            from .a2a_mode import A2AMode
+
+            api.register_mode(A2AMode)
+            logger.info("CloudPaw: registered A2A mode")
+        except Exception as e:
+            logger.warning(
+                "Failed to register A2A mode: %s",
+                e,
+                exc_info=True,
+            )
+
         api.register_startup_hook(
             hook_name="cloudpaw_init",
             callback=self._on_startup,
@@ -564,9 +573,6 @@ class CloudPawPlugin:
 
         logger.info("[CloudPaw] Initializing A2A client manager...")
         _init_a2a_manager()
-
-        logger.info("[CloudPaw] Registering /a2a control command...")
-        _register_a2a_command()
 
         logger.info("[CloudPaw] Checking aliyun CLI availability...")
         await _ensure_aliyun_cli()

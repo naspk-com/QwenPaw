@@ -6,24 +6,55 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncGenerator, Union
+from typing import Any, AsyncGenerator, Dict, Optional, Union
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
-from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
-from ...utils.logging import LOG_FILE_PATH
+from qwenpaw.schemas import (
+    AgentRequest,
+    _coerce_content_item,
+)
+from ...utils.logging import LOG_FILE_PATH, sanitize_log_value
 from ..agent_context import get_agent_for_request
-from ..runner.title_generator import generate_and_update_title
+from ..approvals.display import approval_display_fields
+from ..chats.title_generator import generate_and_update_title
 from ..utils import check_upload_size
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/console", tags=["console"])
+
+
+# ── Background task store ──
+
+
+@dataclass
+class _BackgroundTask:
+    """In-memory state for a background chat task."""
+
+    status: str = "submitted"
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+    asyncio_task: Optional[asyncio.Task] = None
+
+
+_bg_tasks: Dict[str, _BackgroundTask] = {}
+_bg_lock = asyncio.Lock()
 
 
 class MarkInboxReadRequest(BaseModel):
@@ -91,17 +122,40 @@ def _extract_session_and_payload(request_data: Union[AgentRequest, dict]):
             if hasattr(content_part, "content"):
                 content_parts.extend(list(content_part.content or []))
             elif isinstance(content_part, dict) and "content" in content_part:
-                content_parts.extend(content_part["content"] or [])
+                # Coerce raw dicts to typed Content models so downstream
+                # getattr checks (e.g. _content_has_text) see real attrs.
+                content_parts.extend(
+                    _coerce_content_item(c)
+                    for c in (content_part["content"] or [])
+                )
+
+    meta: dict = {
+        "session_id": session_id,
+        "user_id": sender_id,
+    }
+
+    # Preserve request_context (e.g. session-level approval_level)
+    if isinstance(request_data, AgentRequest):
+        rc = getattr(request_data, "request_context", None)
+    else:
+        rc = request_data.get("request_context")
+    if isinstance(rc, dict) and rc:
+        meta["request_context"] = rc
 
     native_payload = {
         "channel_id": channel_id,
         "sender_id": sender_id,
         "content_parts": content_parts,
-        "meta": {
-            "session_id": session_id,
-            "user_id": sender_id,
-        },
+        "meta": meta,
     }
+
+    if isinstance(request_data, AgentRequest):
+        mso = getattr(request_data, "model_slot_override", None)
+    else:
+        mso = request_data.get("model_slot_override")
+    if mso is not None:
+        native_payload["model_slot_override"] = mso
+
     return native_payload
 
 
@@ -250,7 +304,7 @@ async def post_console_chat_stop(
             "[STOP API] chat_id not found in tracker, trying to resolve "
             "from session_id...",
         )
-        chat_manager = getattr(workspace.runner, "_chat_manager", None)
+        chat_manager = workspace.chat_manager
         if chat_manager:
             resolved_chat_id = await chat_manager.get_chat_id_by_session(
                 session_id=chat_id,
@@ -379,10 +433,13 @@ async def get_push_messages(
             "owner_agent_id": p.owner_agent_id,
             "agent_id": p.agent_id,
             "tool_name": p.tool_name,
+            **approval_display_fields(p),
             "severity": p.severity,
             "findings_count": p.findings_count,
             "findings_summary": p.result_summary,
             "tool_params": p.extra.get("tool_call", {}).get("input", {}),
+            "source_type": p.extra.get("source_type", "tool_guard"),
+            "driver": p.extra.get("driver"),
             "created_at": p.created_at,
             "timeout_seconds": p.timeout_seconds,
         }
@@ -449,5 +506,222 @@ async def get_inbox_trace(run_id: str):
 
     trace = await get_trace(run_id)
     if trace is None:
-        raise HTTPException(status_code=404, detail="trace not found")
+        raise HTTPException(
+            status_code=404,
+            detail="trace not found",
+        )
     return trace
+
+
+# ── Background chat task endpoints ──
+
+
+def _parse_sse_payload(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a single SSE data line into a dict."""
+    stripped = line.strip()
+    if stripped.startswith("data: "):
+        try:
+            return json.loads(stripped[6:])
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
+@router.post(
+    "/chat/task",
+    status_code=200,
+    summary="Submit a background chat task",
+)
+async def post_console_chat_task(  # pylint: disable=too-many-statements
+    request_data: Union[AgentRequest, dict],
+    request: Request,
+) -> dict:
+    """Run an agent chat as a background task.
+
+    Returns a ``task_id`` immediately. Poll status via
+    ``GET /console/chat/task/{task_id}``.
+    """
+    workspace = await get_agent_for_request(request)
+    console_channel = await workspace.channel_manager.get_channel("console")
+    if console_channel is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Channel Console not found",
+        )
+
+    task_id = f"task-{uuid.uuid4().hex[:12]}"
+    native_payload = _extract_session_and_payload(request_data)
+    session_id = console_channel.resolve_session_id(
+        sender_id=native_payload["sender_id"],
+        channel_meta=native_payload["meta"],
+    )
+    name, _ = _extract_placeholder_name(native_payload["content_parts"])
+    await workspace.chat_manager.get_or_create_chat(
+        session_id,
+        native_payload["sender_id"],
+        native_payload["channel_id"],
+        name=name,
+    )
+
+    task_timeout: Optional[float] = None
+    fork_project_dir = ""
+    fork_worktree_branch = ""
+    fork_scope_id = ""
+    if isinstance(request_data, dict):
+        task_timeout = request_data.get("timeout")
+        rc = request_data.get("request_context")
+        if isinstance(rc, dict):
+            fork_project_dir = str(rc.get("fork_project_dir") or "")
+            fork_worktree_branch = str(
+                rc.get("fork_worktree_branch") or "",
+            )
+            fork_scope_id = str(rc.get("fork_scope_id") or "")
+    elif hasattr(request_data, "timeout"):
+        task_timeout = getattr(request_data, "timeout", None)
+        rc = getattr(request_data, "request_context", None)
+        if isinstance(rc, dict):
+            fork_project_dir = str(rc.get("fork_project_dir") or "")
+            fork_worktree_branch = str(
+                rc.get("fork_worktree_branch") or "",
+            )
+            fork_scope_id = str(rc.get("fork_scope_id") or "")
+
+    bg = _BackgroundTask(
+        status="running",
+        started_at=time.time(),
+    )
+
+    async def _run() -> None:
+        last_response: Optional[Dict[str, Any]] = None
+        try:
+            async for sse_line in console_channel.stream_one(
+                native_payload,
+            ):
+                parsed = _parse_sse_payload(sse_line)
+                if parsed and parsed.get("type") != "turn_usage":
+                    last_response = parsed
+        except asyncio.CancelledError:
+            bg.status = "finished"
+            bg.finished_at = time.time()
+            bg.result = {
+                "status": "failed",
+                "error": {"message": "Task cancelled"},
+            }
+            if fork_project_dir and fork_worktree_branch:
+                try:
+                    from qwenpaw.agents.fork_project import mark_fork_failed
+
+                    await asyncio.to_thread(
+                        mark_fork_failed,
+                        fork_project_dir,
+                        fork_worktree_branch,
+                        reason="Task cancelled",
+                        expected_scope=fork_scope_id or None,
+                    )
+                except Exception:
+                    logger.warning(
+                        "mark_fork_failed on cancel failed for %s",
+                        sanitize_log_value(fork_worktree_branch),
+                        exc_info=True,
+                    )
+            return
+        except Exception as exc:
+            bg.status = "finished"
+            bg.finished_at = time.time()
+            bg.result = {
+                "status": "failed",
+                "error": {"message": str(exc)},
+            }
+            if fork_project_dir and fork_worktree_branch:
+                try:
+                    from qwenpaw.agents.fork_project import mark_fork_failed
+
+                    await asyncio.to_thread(
+                        mark_fork_failed,
+                        fork_project_dir,
+                        fork_worktree_branch,
+                        reason=str(exc),
+                        expected_scope=fork_scope_id or None,
+                    )
+                except Exception:
+                    logger.warning(
+                        "mark_fork_failed on error failed for %s",
+                        sanitize_log_value(fork_worktree_branch),
+                        exc_info=True,
+                    )
+            return
+
+        bg.status = "finished"
+        bg.finished_at = time.time()
+        if last_response is not None:
+            bg.result = {
+                "status": "completed",
+                "session_id": session_id,
+                **last_response,
+            }
+        else:
+            bg.result = {
+                "status": "completed",
+                "session_id": session_id,
+                "output": [],
+            }
+        # Fork subagents: commit dirty worktree so branch tips are mergeable.
+        if fork_project_dir and fork_worktree_branch:
+            try:
+                from qwenpaw.agents.fork_project import (
+                    finalize_fork_worktree_or_fail,
+                )
+
+                await asyncio.to_thread(
+                    finalize_fork_worktree_or_fail,
+                    fork_project_dir,
+                    fork_worktree_branch,
+                    message=f"fork worker {fork_worktree_branch}",
+                    expected_scope=fork_scope_id or None,
+                )
+            except Exception:
+                logger.warning(
+                    "Background fork finalize failed for %s (%s)",
+                    sanitize_log_value(fork_worktree_branch),
+                    sanitize_log_value(fork_project_dir),
+                    exc_info=True,
+                )
+
+    atask = asyncio.create_task(_run())
+    bg.asyncio_task = atask
+
+    if task_timeout is not None and task_timeout > 0:
+
+        async def _timeout_guard() -> None:
+            await asyncio.sleep(task_timeout)
+            if not atask.done():
+                atask.cancel()
+
+        asyncio.create_task(_timeout_guard())
+
+    async with _bg_lock:
+        _bg_tasks[task_id] = bg
+
+    return {"task_id": task_id}
+
+
+@router.get(
+    "/chat/task/{task_id}",
+    status_code=200,
+    summary="Check background chat task status",
+)
+async def get_console_chat_task(task_id: str) -> dict:
+    """Return the current status of a background chat task."""
+    async with _bg_lock:
+        bg = _bg_tasks.get(task_id)
+    if bg is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task not found: {task_id}",
+        )
+    response: Dict[str, Any] = {"status": bg.status}
+    if bg.started_at is not None:
+        response["started_at"] = bg.started_at
+    if bg.status == "finished" and bg.result is not None:
+        response["result"] = bg.result
+    return response

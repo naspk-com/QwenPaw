@@ -408,6 +408,19 @@ reset_auth() {
     fi
 }
 
+check_tunnel_installed() {
+    local tunnel_api="/var/apps/com.dustinky.tunnel/target/ui/api.cgi"
+    local installed=false
+
+    if [ -f "${tunnel_api}" ]; then
+        installed=true
+    fi
+
+    echo "Content-Type: application/json"
+    echo ""
+    echo "{\"success\":true,\"installed\":${installed}}"
+}
+
 backup_download() {
     local working_base="/var/apps/com.dustinky.qwenpaw/shares/com.dustinky.qwenpaw"
     local working_dir="${working_base}/.qwenpaw"
@@ -478,6 +491,8 @@ if [ -n "$QUERY_STRING" ]; then
         action="reset_auth"
     elif echo "$QUERY_STRING" | grep -q "action=backup_download"; then
         action="backup_download"
+    elif echo "$QUERY_STRING" | grep -q "action=check_tunnel"; then
+        action="check_tunnel"
     fi
 fi
 
@@ -504,6 +519,8 @@ if [ -z "$action" ] && [ -n "$REQUEST_URI" ]; then
         action="reset_auth"
     elif echo "$REQUEST_URI" | grep -q "action=backup_download"; then
         action="backup_download"
+    elif echo "$REQUEST_URI" | grep -q "action=check_tunnel"; then
+        action="check_tunnel"
     fi
 fi
 
@@ -540,6 +557,9 @@ case "$action" in
         ;;
     backup_download)
         backup_download
+        ;;
+    check_tunnel)
+        check_tunnel_installed
         ;;
     *)
         echo "Content-Type: application/json"
