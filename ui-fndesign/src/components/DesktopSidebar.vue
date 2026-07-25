@@ -18,7 +18,7 @@ const items = ref(navigationConfig.desktop)
       />
     </div>
     <div class="pt-3 pb-1 text-xs text-[var(--ui-text-muted)] text-center border-t border-[var(--ui-border)]/90">
-      v2.0.0 © {{ new Date().getFullYear() }}
+      v2.0.1 © {{ new Date().getFullYear() }}
       <a
         class="font-bold text-primary"
         href="https://fnosp.dustinky.com"

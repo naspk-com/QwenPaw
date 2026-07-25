@@ -96,17 +96,21 @@ restore_memory_files() {
     done
 }
 
-# ── 克隆上游并同步到 CODE_DIR ──
+# ── 克隆上游标签并同步到 CODE_DIR ──
 sync_upstream() {
-    echo "==> 克隆上游仓库到临时目录"
+    local version="$1"
+    local tag="v${version}"
+
+    echo "==> 克隆上游仓库标签 ${tag} 到临时目录"
     echo "    上游: ${UPSTREAM_URL}"
+    echo "    标签: ${tag}"
     echo "    临时目录: ${TEMP_DIR}"
 
-    git clone --depth 1 "${UPSTREAM_URL}" "${TEMP_DIR}"
+    git clone --branch "${tag}" --depth 1 "${UPSTREAM_URL}" "${TEMP_DIR}"
 
     local upstream_commit
     upstream_commit="$(cd "${TEMP_DIR}" && git log -1 --oneline)"
-    echo "    上游最新: ${upstream_commit}"
+    echo "    上游 ${tag}: ${upstream_commit}"
 
     echo "==> 同步上游代码到 CODE_DIR"
     echo "    目标: ${CODE_DIR}"
@@ -287,8 +291,8 @@ main() {
     # 1. 备份自定义 MEMORY.md
     backup_memory_files
 
-    # 2. 克隆上游并同步
-    sync_upstream
+    # 2. 克隆上游标签并同步
+    sync_upstream "${new_version}"
 
     # 3. 恢复自定义 MEMORY.md
     restore_memory_files

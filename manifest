@@ -1,5 +1,5 @@
 appname                    = com.dustinky.qwenpaw
-version                    = 2.0.0
+version                    = 2.0.1
 display_name               = QwenPaw
 desc                       = `<p>QwenPaw 是一款个人助理型产品（国产小龙虾），部署在你自己的环境中。</p><h3>核心功能</h3><p>多通道对话（微信、QQ、钉钉、飞书、Discord、Telegram 等），多智能体协作（独立配置、记忆和技能，互相通信完成复杂任务），定时执行任务，能力由 Skills 决定且可无限扩展，支持本地运行大模型完全离线工作，数据全在本地不依赖第三方托管，多层安全防护机制。使用 Ollama 需先在飞牛应用商店安装 Ollama 应用，连接时 API Key 不可为空。更多问题可加入 QQ 群 <a href="https://qm.qq.com/q/b7M0Myqihc" target="_blank">1091348192</a> 进行交流。</p>`
 platform                   = all
@@ -15,4 +15,4 @@ checkport                  = false
 service_port               = 19091
 disable_authorization_path = false
 install_dep_apps           = nodejs_v24:python312
-changelog                  = "QwenPaw 2.0.0 版本进行了全面重构，引入了基于 AgentScope 2.0 的 Runtime 2.0 核心架构、新的 Loop Engineering 设计、统一的 Scroll Context 和 ReMe 长期记忆系统，并增强了安全沙箱、TUI 界面、多频道支持，同时将桌面端迁移至 Tauri，实现了更强大的功能和更好的性能。"
+changelog                  = "QwenPaw 2.0.1 版本推出了 PawApp 小程序平台和用户可编辑的自定义智能体模式，增强了记忆系统、安全治理和多智能体协作功能，同时修复了大量运行时、UI、安全和集成方面的问题，并提升了性能和测试覆盖率。"
