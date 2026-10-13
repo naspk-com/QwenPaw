@@ -10,7 +10,7 @@ MD_FILES_DIR="${CODE_DIR}/src/qwenpaw/agents/md_files"
 MANIFEST_PATH="${PROJECT_ROOT}/manifest"
 SIDEBAR_PATH="${UI_FN_DESIGN}/src/components/DesktopSidebar.vue"
 DIST_DIR="${PROJECT_ROOT}/dist"
-UPSTREAM_URL="https://github.com/agentscope-ai/QwenPaw.git"
+# 上游代码统一从本地镜像仓库 ${PROJECT_ROOT}/QwenPaw 同步
 
 TMP_BASE="${HOME}/.cache/qwenpaw"
 mkdir -p "${TMP_BASE}"
@@ -96,17 +96,35 @@ restore_memory_files() {
     done
 }
 
-# ── 克隆上游标签并同步到 CODE_DIR ──
+# ── 从本地镜像仓库同步上游标签到 CODE_DIR ──
 sync_upstream() {
     local version="$1"
     local tag="v${version}"
+    local repo="${PROJECT_ROOT}/QwenPaw"
 
-    echo "==> 克隆上游仓库标签 ${tag} 到临时目录"
-    echo "    上游: ${UPSTREAM_URL}"
-    echo "    标签: ${tag}"
+    if [ ! -d "${repo}/.git" ]; then
+        echo "错误: 本地镜像仓库不存在: ${repo}" >&2
+        echo "请先执行: git clone https://github.com/agentscope-ai/QwenPaw.git ${repo}" >&2
+        exit 1
+    fi
+
+    echo "==> 从本地镜像仓库拉取最新标签"
+    echo "    本地仓库: ${repo}"
+    if ! git -C "${repo}" fetch --tags origin 2>/dev/null; then
+        echo "    警告: fetch 失败（可能网络不可用），将使用本地已有标签"
+    fi
+
+    if ! git -C "${repo}" rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
+        echo "错误: 本地仓库不存在标签 ${tag}" >&2
+        echo "可用标签（最近 10 个）:" >&2
+        git -C "${repo}" tag --sort=-v:refname | head -10 >&2
+        exit 1
+    fi
+
+    echo "==> 克隆本地仓库标签 ${tag} 到临时目录"
     echo "    临时目录: ${TEMP_DIR}"
 
-    git clone --branch "${tag}" --depth 1 "${UPSTREAM_URL}" "${TEMP_DIR}"
+    git clone --branch "${tag}" --depth 1 "file://${repo}" "${TEMP_DIR}"
 
     local upstream_commit
     upstream_commit="$(cd "${TEMP_DIR}" && git log -1 --oneline)"

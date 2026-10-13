@@ -263,6 +263,9 @@ class ConsoleChannel(BaseChannel):
             content_parts=content_parts,
             channel_meta=meta,
         )
+        message_metadata = payload.get("message_metadata")
+        if isinstance(message_metadata, dict) and request.input:
+            request.input[0].metadata = message_metadata
         request.channel_meta = meta
         rc = meta.get("request_context")
         if isinstance(rc, dict) and rc:
@@ -415,6 +418,7 @@ class ConsoleChannel(BaseChannel):
             send_meta.setdefault("bot_prefix", self.bot_prefix)
             last_response = None
             event_count = 0
+            headline_stream_states: dict[str, Any] = {}
 
             async for event in self._process(request):
                 event_count += 1
@@ -440,7 +444,27 @@ class ConsoleChannel(BaseChannel):
                         for message in event_output:
                             event.output.append(message)
 
-                data = self._serialize_event_for_sse(event)
+                if obj == "message" and status == RunStatus.Completed:
+                    msg_id = str(
+                        getattr(event, "msg_id", "")
+                        or getattr(event, "id", "")
+                        or "",
+                    )
+                    for pending_data in self._flush_headline_stream_states(
+                        headline_stream_states,
+                        msg_id=msg_id,
+                    ):
+                        yield f"data: {pending_data}\n\n"
+                elif obj == "response" and status == RunStatus.Completed:
+                    for pending_data in self._flush_headline_stream_states(
+                        headline_stream_states,
+                    ):
+                        yield f"data: {pending_data}\n\n"
+
+                data = self._serialize_event_for_sse(
+                    event,
+                    headline_stream_states,
+                )
                 yield f"data: {data}\n\n"
 
                 if obj == "message" and status == RunStatus.Completed:
@@ -449,6 +473,11 @@ class ConsoleChannel(BaseChannel):
 
                 elif obj == "response":
                     last_response = event
+
+            for pending_data in self._flush_headline_stream_states(
+                headline_stream_states,
+            ):
+                yield f"data: {pending_data}\n\n"
 
             err_msg = self._get_response_error_message(last_response)
             if err_msg:
@@ -470,7 +499,7 @@ class ConsoleChannel(BaseChannel):
 
             to_handle = request.user_id or ""
             if self._on_reply_sent:
-                self._on_reply_sent(
+                await self._on_reply_sent(
                     self.channel,
                     to_handle,
                     request.session_id or f"{self.channel}:{to_handle}",
@@ -497,6 +526,19 @@ class ConsoleChannel(BaseChannel):
             logger.exception("console process/reply failed")
             err_msg = str(e).strip() or "An error occurred while processing."
             self._print_error(err_msg)
+        finally:
+            try:
+                await self._on_response_cycle_end(session_id)
+            except Exception:  # pylint: disable=broad-except
+                logger.warning(
+                    "console response-cycle cleanup failed for session=%s",
+                    session_id[:30],
+                    exc_info=True,
+                )
+
+    async def _on_response_cycle_end(self, session_id: str) -> None:
+        """Delegate console streaming cleanup to the shared channel path."""
+        await self._finish_response_cycle(session_id)
 
     async def consume_one(self, payload: Any) -> None:
         """Process one payload; drain stream_one (queue/terminal)."""
