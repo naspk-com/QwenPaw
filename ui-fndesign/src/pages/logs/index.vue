@@ -2,10 +2,11 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 interface LogItem {
-  level?: string
-  time?: string
-  message?: string
+  message: string
 }
+
+type LogSource = 'runtime' | 'upgrade' | 'install'
+type LogLevel = 'all' | 'error' | 'warning' | 'info' | 'debug' | 'other'
 
 const toast = useToast()
 const showNotification = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info') => {
@@ -29,10 +30,31 @@ const showNotification = (message: string, type: 'success' | 'error' | 'warning'
 const logs = ref<LogItem[]>([])
 const isLoading = ref(false)
 const filterText = ref('')
+const source = ref<LogSource>('runtime')
+const level = ref<LogLevel>('all')
+const loadError = ref('')
+const missing = ref(false)
+const showClearConfirm = ref(false)
+const isClearing = ref(false)
+const sourceItems = [
+  { label: '运行日志', value: 'runtime' },
+  { label: '升级日志', value: 'upgrade' },
+  { label: '安装日志（暂不可用）', value: 'install' }
+]
+const levelItems = [
+  { label: '全部级别', value: 'all' },
+  { label: '错误', value: 'error' },
+  { label: '警告', value: 'warning' },
+  { label: '信息', value: 'info' },
+  { label: '调试', value: 'debug' },
+  { label: '未标记级别', value: 'other' }
+]
 
 const autoRefresh = ref<boolean>(true)
 let refreshTimer: number | null = null
 const refreshIntervalMs = 3000
+let requestId = 0
+let disposed = false
 
 const page = ref(1)
 const pageSize = ref(10)
@@ -44,13 +66,22 @@ const pageSizeItems = [
 ]
 
 const filteredLogs = computed(() => {
-  const needle = filterText.value.trim().toLowerCase()
-  if (!needle) return logs.value
+  const terms = filterText.value.toLowerCase().trim().split(/\s+/).filter(Boolean)
   return logs.value.filter((log) => {
-    const msg = (log.message || '').toLowerCase()
-    return msg.includes(needle)
+    const message = log.message.toLowerCase()
+    return terms.every(term => message.includes(term))
+      && (level.value === 'all' || getLevel(log.message) === level.value)
   })
 })
+
+const getLevel = (message: string): Exclude<LogLevel, 'all'> => {
+  const match = message.match(/(?:^|[\s[\]|:])(critical|fatal|error|warning|warn|info|debug)(?=$|[\s\]|:])/i)
+  const value = match?.[1]?.toLowerCase()
+  if (value === 'critical' || value === 'fatal' || value === 'error') return 'error'
+  if (value === 'warning' || value === 'warn') return 'warning'
+  if (value === 'info' || value === 'debug') return value
+  return 'other'
+}
 
 const pageCount = computed(() => Math.max(1, Math.ceil(filteredLogs.value.length / pageSize.value)))
 const pagedLogs = computed(() => {
@@ -63,38 +94,62 @@ const clampPage = () => {
   page.value = Math.min(Math.max(1, page.value), pageCount.value)
 }
 
-watch([filterText, pageSize], () => {
+watch([filterText, level, pageSize], () => {
   page.value = 1
 })
 
 watch(pageCount, clampPage, { immediate: true })
 
 const fetchLogs = async (notify = false) => {
-  isLoading.value = true
-  try {
-    const response = await fetch('/cgi/ThirdParty/com.dustinky.qwenpaw/api.cgi?action=logs')
-    const result = await response.json() as { success?: boolean; logs?: LogItem[]; message?: string }
-    if (result?.success) {
-      logs.value = Array.isArray(result.logs) ? result.logs : []
-      if (notify) showNotification('日志已刷新', 'success')
-      return
-    }
-    if (notify) showNotification('获取日志失败：' + (result?.message || '未知错误'), 'error')
-  } catch (err: unknown) {
-    if (notify) {
-      const e = err as Error
-      showNotification('获取日志失败：' + (e?.message || String(err)), 'error')
-    }
-  } finally {
+  const currentRequest = ++requestId
+  const selectedSource = source.value
+  if (selectedSource === 'install') {
+    logs.value = []
     isLoading.value = false
+    loadError.value = ''
+    missing.value = false
+    return
+  }
+  isLoading.value = true
+  loadError.value = ''
+  try {
+    const action = selectedSource === 'runtime' ? 'logs' : 'upgrade_logs'
+    const response = await fetch(`/cgi/ThirdParty/com.dustinky.qwenpaw/api.cgi?action=${action}`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const result = await response.json() as { success?: boolean; logs?: LogItem[]; message?: string; missing?: boolean }
+    if (!result.success) throw new Error(result.message || '未知错误')
+    if (currentRequest !== requestId || disposed) return
+    logs.value = Array.isArray(result.logs) ? result.logs.filter(item => typeof item.message === 'string') : []
+    missing.value = result.missing === true
+    if (notify) showNotification('日志已刷新', 'success')
+  } catch (err: unknown) {
+    if (currentRequest !== requestId || disposed) return
+    loadError.value = err instanceof Error ? err.message : String(err)
+    if (notify) showNotification('获取日志失败：' + loadError.value, 'error')
+  } finally {
+    if (currentRequest === requestId) isLoading.value = false
   }
 }
 
+const exportLogs = () => {
+  if (!filteredLogs.value.length) return
+  const text = filteredLogs.value.map(log => log.message).join('\n') + '\n'
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `qwenpaw-${source.value}-filtered.log`
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
 const clearLogs = async () => {
+  isClearing.value = true
   try {
     const response = await fetch('/cgi/ThirdParty/com.dustinky.qwenpaw/api.cgi?action=clear_logs', { method: 'POST' })
     const result = await response.json() as { success?: boolean; message?: string }
     if (result?.success) {
+      requestId++
+      isLoading.value = false
       logs.value = []
       page.value = 1
       showNotification(result?.message || '日志已清空', 'success')
@@ -104,6 +159,9 @@ const clearLogs = async () => {
   } catch (err: unknown) {
     const e = err as Error
     showNotification('清空日志失败：' + (e?.message || String(err)), 'error')
+  } finally {
+    isClearing.value = false
+    showClearConfirm.value = false
   }
 }
 
@@ -112,23 +170,33 @@ const scheduleRefresh = () => {
     window.clearTimeout(refreshTimer)
     refreshTimer = null
   }
-  if (autoRefresh.value !== true) return
+  if (disposed || autoRefresh.value !== true) return
 
   refreshTimer = window.setTimeout(async () => {
-    await fetchLogs()
+    if (!isClearing.value) await fetchLogs()
     scheduleRefresh()
   }, refreshIntervalMs)
 }
 
 watch(autoRefresh, () => {
   scheduleRefresh()
-}, { immediate: true })
+})
+
+watch(source, () => {
+  logs.value = []
+  page.value = 1
+  missing.value = false
+  void fetchLogs()
+})
 
 onMounted(async () => {
   await fetchLogs()
+  scheduleRefresh()
 })
 
 onUnmounted(() => {
+  disposed = true
+  requestId++
   if (refreshTimer) window.clearTimeout(refreshTimer)
 })
 </script>
@@ -138,10 +206,10 @@ onUnmounted(() => {
     <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
       <div>
         <h1 class="text-3xl font-bold text-[var(--ui-text)]">
-          运行日志
+          日志查看
         </h1>
         <p class="text-[var(--ui-text-muted)] mt-2">
-          查看 QwenPaw 运行日志与升级日志（最新 500 条）
+          查看运行和升级日志，筛选或导出最近 500 行。
         </p>
       </div>
 
@@ -152,6 +220,7 @@ onUnmounted(() => {
           </span>
           <USwitch
             v-model="autoRefresh"
+            aria-label="自动刷新"
           />
         </div>
         <UButton
@@ -164,25 +233,47 @@ onUnmounted(() => {
           刷新
         </UButton>
         <UButton
+          color="neutral"
+          variant="outline"
+          icon="i-lucide-download"
+          :disabled="!filteredLogs.length || !!loadError || source === 'install'"
+          @click="exportLogs"
+        >
+          导出筛选结果
+        </UButton>
+        <UButton
           color="error"
           variant="soft"
           icon="i-lucide-trash-2"
-          @click="clearLogs"
+          @click="showClearConfirm = true"
         >
           清空
         </UButton>
       </div>
     </div>
 
-    <div class="flex flex-row items-center justify-between gap-3">
+    <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+      <USelect
+        v-model="source"
+        :items="sourceItems"
+        aria-label="日志类型"
+        class="w-full sm:w-48"
+      />
       <UInput
         v-model="filterText"
         icon="i-lucide-search"
-        placeholder="筛选日志内容..."
-        class="w-full md:max-w-md"
+        placeholder="搜索关键词，空格分隔"
+        aria-label="搜索日志"
+        class="w-full sm:min-w-48 sm:flex-1"
+      />
+      <USelect
+        v-model="level"
+        :items="levelItems"
+        aria-label="日志级别"
+        class="w-full sm:w-40"
       />
 
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 sm:ml-auto">
         <span class="text-sm text-[var(--ui-text-muted)] whitespace-nowrap">
           每页
         </span>
@@ -194,12 +285,36 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="space-y-3">
+    <p class="text-sm text-[var(--ui-text-muted)]">
+      搜索同时匹配所有关键词；级别依据日志中的英文标记识别。导出仅包含当前筛选出的已加载日志，可能包含敏感信息。
+    </p>
+
+    <UAlert
+      v-if="source === 'install'"
+      color="warning"
+      variant="soft"
+      title="安装日志暂不可用"
+      description="安装日志可能包含敏感信息。管理接口完成管理员身份校验后，才能安全开放查看和导出。"
+      icon="i-lucide-shield-alert"
+    />
+    <UAlert
+      v-else-if="loadError"
+      color="error"
+      variant="soft"
+      title="日志读取失败"
+      :description="loadError"
+      icon="i-lucide-circle-alert"
+    />
+
+    <div
+      v-else
+      class="space-y-3"
+    >
       <div
         v-if="pagedLogs.length === 0"
         class="py-10 text-center text-sm text-[var(--ui-text-muted)]"
       >
-        暂无日志
+        {{ isLoading ? '正在读取日志...' : missing ? '日志文件尚未生成' : logs.length ? '没有符合筛选条件的日志' : '暂无日志' }}
       </div>
 
       <UCard
@@ -209,10 +324,7 @@ onUnmounted(() => {
         :ui="{ root: 'divide-y-0', body: 'py-3' }"
       >
         <div class="flex items-start gap-3">
-          <div class="text-xs text-[var(--ui-text-muted)] font-mono tabular-nums whitespace-nowrap shrink-0">
-            {{ log.time || '' }}
-          </div>
-          <div class="text-sm text-[var(--ui-text)] min-w-0 break-words">
+          <div class="text-sm text-[var(--ui-text)] min-w-0 break-words whitespace-pre-wrap font-mono">
             {{ log.message || '-' }}
           </div>
         </div>
@@ -224,7 +336,7 @@ onUnmounted(() => {
       class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between"
     >
       <div class="text-sm text-[var(--ui-text-muted)]">
-        共 {{ filteredLogs.length }} 条
+        匹配 {{ filteredLogs.length }} / {{ logs.length }} 行
       </div>
       <UPagination
         v-model:page="page"
@@ -236,5 +348,30 @@ onUnmounted(() => {
         size="sm"
       />
     </div>
+
+    <UModal
+      v-model:open="showClearConfirm"
+      title="清空日志"
+      description="将清空运行日志和升级日志，此操作无法撤销。"
+    >
+      <template #footer>
+        <div class="flex w-full justify-end gap-2">
+          <UButton
+            color="neutral"
+            variant="outline"
+            @click="showClearConfirm = false"
+          >
+            取消
+          </UButton>
+          <UButton
+            color="error"
+            :loading="isClearing"
+            @click="clearLogs"
+          >
+            确认清空
+          </UButton>
+        </div>
+      </template>
+    </UModal>
   </div>
 </template>

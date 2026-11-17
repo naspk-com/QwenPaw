@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import os
 from pathlib import Path, PurePosixPath
@@ -19,18 +19,21 @@ from typing import Any, Final
 from uuid import uuid4
 
 from pydantic import ValidationError
+from domain.errors import BadRequestError
 from services.runtime_files.atomic_store import (
     atomic_replace_path,
     fsync_directory as runtime_fsync_directory,
 )
 from services.runtime_files.locking import CrossProcessFileLock
+from services.runtime_files.path_safety import is_link_path, is_link_stat
 from services.storage_root import require_creator_data_root
 from utils.logger import setup_logger
 
 from .models import Project
+from .archive import write_project_archive
 from .serialization import (
     CanonicalJsonError,
-    load_project_json_with_etag,
+    load_project_json_with_source,
     project_etag,
     project_file_bytes,
 )
@@ -38,7 +41,7 @@ from .serialization import (
 logger = setup_logger("store")
 
 
-DEFAULT_MAX_PROJECT_JSON_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_PROJECT_JSON_BYTES = 32 * 1024 * 1024
 _SAFE_PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Projects materialized from plugin-bundled inspiration examples carry this
@@ -85,6 +88,19 @@ class ProjectSnapshot:
     project: Project
     etag: str
     generation: int
+    # The exact persisted source document ``etag`` was hashed from, when this
+    # snapshot was read from disk; None for snapshots built in memory (create /
+    # replace / review) whose ``model_dump`` already is the authority that
+    # ``project_etag`` hashed. A commit boundary writes this as ``base.json``
+    # so it and ``etag`` share one representation even after a load-time repair
+    # changed a stored field. See serialization.load_project_json_with_source.
+    # Auxiliary to identity: a snapshot read back from disk represents the same
+    # state as one built in memory, so it is excluded from equality/repr.
+    source_document: dict[str, Any] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +338,7 @@ class ProjectStore:
             target_stat = target.lstat()
         except FileNotFoundError as exc:
             raise ProjectNotFound(f"Project not found: {safe_id}") from exc
-        if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(
+        if is_link_stat(target_stat) or not stat.S_ISREG(
             target_stat.st_mode,
         ):
             raise ProjectIntegrityError(
@@ -339,7 +355,11 @@ class ProjectStore:
                 f"project.json exceeds {self.max_project_json_bytes} bytes",
             )
         try:
-            project, source_etag = load_project_json_with_etag(payload)
+            (
+                project,
+                source_etag,
+                source_document,
+            ) = load_project_json_with_source(payload)
         except CanonicalJsonError as exc:
             raise ProjectIntegrityError(
                 f"Invalid project.json for {safe_id}",
@@ -353,6 +373,7 @@ class ProjectStore:
             project=project,
             etag=source_etag,
             generation=project.generation,
+            source_document=source_document,
         )
 
     def replace(
@@ -424,7 +445,7 @@ class ProjectStore:
         for entry in entries:
             if (
                 entry.name.startswith(".deleted-")
-                or entry.is_symlink()
+                or is_link_path(entry)
                 or not entry.is_dir()
             ):
                 continue
@@ -497,7 +518,7 @@ class ProjectStore:
                 safe_id = _safe_project_id(entry.name)
             except (OSError, UnsafeProjectPath):
                 continue
-            if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(
+            if is_link_stat(entry_stat) or not stat.S_ISDIR(
                 entry_stat.st_mode,
             ):
                 continue
@@ -577,7 +598,7 @@ class ProjectStore:
         logger.info("project deleted: %s", safe_id)
 
     def export(self, project_id: str) -> tuple[int, Iterator[bytes]]:
-        """Compress the whole Project folder into a zip under ``CREATOR_DATA_ROOT``/exports/.
+        """Archive the Project and recoverable Runtime under ``CREATOR_DATA_ROOT``/exports/.
         Returns the archive byte size plus an iterator yielding the contents
         in 8192-byte chunks, so HTTP callers can advertise Content-Length for
         download progress without loading the whole file into memory.
@@ -598,15 +619,17 @@ class ProjectStore:
         # files are atomically replaced, and export is explicitly a best-effort
         # snapshot. Holding the global mutation boundary across ZIP I/O caused
         # common 10-second lock timeouts on large Projects.
-        self.read(safe_id)
+        snapshot = self.read(safe_id)
         try:
-            archive_path = shutil.make_archive(
-                str(export_root / zip_file_stem),
-                "zip",
-                root_dir=str(self.root),
-                base_dir=safe_id,
+            archive_path = str(export_root / f"{zip_file_stem}.zip")
+            write_project_archive(
+                self.project_root(safe_id),
+                snapshot.project,
+                Path(archive_path),
             )
             logger.info(f"export file path:{archive_path}")
+        except BadRequestError:
+            raise
         except Exception as e:
             logger.error(
                 f"failed to create export file for project {safe_id}",
@@ -706,7 +729,7 @@ class ProjectStore:
             project_stat = project_root.lstat()
         except FileNotFoundError as exc:
             raise ProjectNotFound(f"Project not found: {project_id}") from exc
-        if stat.S_ISLNK(project_stat.st_mode) or not stat.S_ISDIR(
+        if is_link_stat(project_stat) or not stat.S_ISDIR(
             project_stat.st_mode,
         ):
             raise UnsafeProjectPath(
@@ -731,7 +754,7 @@ class ProjectStore:
             raise ProjectIntegrityError(
                 "Project assets directory is missing",
             ) from exc
-        if stat.S_ISLNK(assets_stat.st_mode) or not stat.S_ISDIR(
+        if is_link_stat(assets_stat) or not stat.S_ISDIR(
             assets_stat.st_mode,
         ):
             raise UnsafeProjectPath("Project assets must be a real directory")

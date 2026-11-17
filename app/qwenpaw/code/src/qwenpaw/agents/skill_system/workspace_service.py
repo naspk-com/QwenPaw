@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ...exceptions import SkillsError
+from ...installation_origin import validated_origin
 from ...utils.io_utils import write_text_atomic
 from ..utils.file_handling import read_text_file_with_encoding_fallback
 from .models import SkillInfo
@@ -21,7 +22,9 @@ from .registry import (
 from .store import (
     build_import_conflict,
     build_skill_metadata,
+    commit_pawport_skill,
     copy_skill_dir,
+    discard_prepared_pawport_skill,
     default_workspace_manifest,
     extract_zip_skills,
     get_workspace_skill_manifest_path,
@@ -48,6 +51,7 @@ def _register_workspace_skill_entry(
     *,
     enable: bool = False,
     installed_from: str = "",
+    installation_origin: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
     source: str | None = None,
 ) -> None:
@@ -75,6 +79,7 @@ def _register_workspace_skill_entry(
         "channels": entry.get("channels") or ["all"],
         "preload": entry.get("preload") is True,
         "source": metadata["source"],
+        "installation_origin": validated_origin(installation_origin),
         "installed_from": (
             installed_from or str(entry.get("installed_from", "") or "")
         ),
@@ -182,6 +187,9 @@ class SkillService:
             source = entry.get("source", "customized")
             skill = read_skill_from_dir(skill_dir, source)
             if skill is not None:
+                skill.installation_origin = validated_origin(
+                    entry.get("installation_origin"),
+                )
                 skills.append(skill)
         return skills
 
@@ -196,11 +204,16 @@ class SkillService:
             entry = manifest.get("skills", {}).get(skill_name, {})
             skill = read_skill_from_dir(
                 skill_root / skill_name,
-                "builtin"
-                if entry.get("source", "customized") == "builtin"
-                else "customized",
+                (
+                    "builtin"
+                    if entry.get("source", "customized") == "builtin"
+                    else "customized"
+                ),
             )
             if skill is not None:
+                skill.installation_origin = validated_origin(
+                    entry.get("installation_origin"),
+                )
                 skills.append(skill)
         return skills
 
@@ -214,6 +227,7 @@ class SkillService:
         config: dict[str, Any] | None = None,
         enable: bool = False,
         installed_from: str = "",
+        installation_origin: dict[str, Any] | None = None,
         source: str | None = None,
     ) -> str | None:
         validate_skill_content(content)
@@ -235,6 +249,7 @@ class SkillService:
                 target_name=skill_name,
                 enable=enable,
                 installed_from=installed_from,
+                installation_origin=installation_origin,
                 config=config,
                 source=source,
             )
@@ -248,6 +263,7 @@ class SkillService:
         enable: bool = False,
         source: str | None = None,
         installed_from: str = "",
+        installation_origin: dict[str, Any] | None = None,
         config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Install one complete local Skill directory without overwriting.
@@ -310,6 +326,7 @@ class SkillService:
                     enable=enable,
                     source=source,
                     installed_from=installed_from,
+                    installation_origin=installation_origin,
                     config=config,
                 )
                 installed_enabled = bool(
@@ -500,6 +517,9 @@ class SkillService:
                 "channels": current_entry.get("channels") or ["all"],
                 "preload": current_entry.get("preload") is True,
                 "source": metadata["source"],
+                "installation_origin": validated_origin(
+                    current_entry.get("installation_origin"),
+                ),
                 "installed_from": str(
                     current_entry.get("installed_from", "") or "",
                 ),
@@ -567,6 +587,9 @@ class SkillService:
                 "channels": current_entry.get("channels") or old_channels,
                 "preload": current_entry.get("preload") is True,
                 "source": metadata["source"],
+                "installation_origin": validated_origin(
+                    current_entry.get("installation_origin"),
+                ),
                 "installed_from": str(
                     current_entry.get("installed_from", "") or "",
                 ),
@@ -595,12 +618,16 @@ class SkillService:
             "name": final_name,
         }
 
+    # Import planning intentionally handles validation, conflicts, and commit
+    # as one transaction-like flow.
+    # pylint: disable-next=too-many-branches
     def import_from_zip(
         self,
         data: bytes,
         enable: bool = False,
         target_name: str | None = None,
         rename_map: dict[str, str] | None = None,
+        pawport_owner: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         skill_root = get_workspace_skills_dir(self.workspace_dir)
         skill_root.mkdir(parents=True, exist_ok=True)
@@ -650,7 +677,13 @@ class SkillService:
                     )
                     continue
                 seen_names.add(skill_name)
-                exists = (skill_root / skill_name).exists()
+                target_dir = skill_root / skill_name
+                exists = target_dir.exists()
+                if exists and pawport_owner is not None:
+                    exists = not discard_prepared_pawport_skill(
+                        target_dir,
+                        pawport_owner,
+                    )
                 if exists:
                     conflicts.append(
                         build_import_conflict(
@@ -673,6 +706,7 @@ class SkillService:
                     skill_dir,
                     skill_root,
                     skill_name,
+                    pawport_owner,
                 ):
                     imported.append(skill_name)
 
@@ -685,6 +719,7 @@ class SkillService:
                         entry = skills.get(name)
                         if entry is not None:
                             entry["installed_from"] = "zip"
+                            entry.pop("installation_origin", None)
 
                 mutate_json(
                     get_workspace_skill_manifest_path(self.workspace_dir),
@@ -695,6 +730,12 @@ class SkillService:
                 if enable:
                     for skill_name in imported:
                         self.enable_skill(skill_name)
+                if pawport_owner is not None:
+                    for skill_name in imported:
+                        commit_pawport_skill(
+                            skill_root / skill_name,
+                            pawport_owner,
+                        )
 
             return {
                 "imported": imported,

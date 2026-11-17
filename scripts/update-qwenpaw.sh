@@ -138,8 +138,11 @@ sync_upstream() {
     local rsync_items=(
         "src/"
         "plugins/"
+        "packages/"
         "pyproject.toml"
         "setup.py"
+        "MANIFEST.in"
+        "README.md"
         ".python-version"
     )
 
@@ -150,6 +153,15 @@ sync_upstream() {
         fi
     done
 
+    mkdir -p "${CODE_DIR}/scripts/pack"
+    for item in generate_plugin_metadata.py validate_channel_contracts.py channel-contract-requirements.txt; do
+        if [ ! -f "${TEMP_DIR}/scripts/pack/${item}" ]; then
+            echo "错误: 上游缺少频道打包所需文件 ${item}" >&2
+            exit 1
+        fi
+        cp "${TEMP_DIR}/scripts/pack/${item}" "${CODE_DIR}/scripts/pack/${item}"
+    done
+
     echo "    同步完成"
 }
 
@@ -158,8 +170,8 @@ build_console() {
     echo "==> 构建前端控制台"
 
     if [ ! -d "${TEMP_DIR}/console" ]; then
-        echo "    console 目录不存在于上游，跳过构建"
-        return
+        echo "错误: 上游缺少 console 目录，无法构建完整安装包" >&2
+        return 1
     fi
 
     echo "    从临时目录构建 console"
@@ -172,6 +184,11 @@ build_console() {
     cd "${console_src}"
     npm ci
     npm run build
+
+    if [ ! -f "${console_src}/dist/index.html" ]; then
+        echo "错误: 上游控制台构建未生成 index.html" >&2
+        return 1
+    fi
 
     cd "${CODE_DIR}"
 
@@ -253,6 +270,10 @@ build_fpk() {
     echo "==> 构建 fnOS 应用包"
 
     ensure_tools
+    if [ ! -f "${CODE_DIR}/src/qwenpaw/console/index.html" ]; then
+        echo "错误: 缺少官方控制台构建产物" >&2
+        return 1
+    fi
 
     local app_name
     local version

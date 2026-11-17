@@ -1,77 +1,67 @@
 #!/bin/bash
 
-PYTHON_BIN="/var/apps/python312/target/bin/python3"
-CODE_DIR="${TRIM_APPDEST}/qwenpaw/code"
-WORKING_DIR="${TRIM_PKGHOME}"
-VENV_DIR="${WORKING_DIR}/venv"
+source "${TRIM_APPDEST}/qwenpaw/runtime.sh" || exit 1
+qwenpaw_setup || exit 1
 
-export HOME="${WORKING_DIR}"
-export QWENPAW_WORKING_DIR="${TRIM_DATA_SHARE_PATHS%%:*}/.qwenpaw"
 LOG_FILE="${TRIM_PKGVAR}/qwenpaw-upgrade.log"
+exec >> "${LOG_FILE}" 2>&1
+echo "开始准备 QwenPaw 升级"
 
-log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "${LOG_FILE}"
-}
-
-log_msg "开始升级 QwenPaw..."
-
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGETC}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}"
-chmod -R 755 "${TRIM_PKGETC}"
-chmod -R 755 "${TRIM_PKGVAR}"
-
-PID_FILE="${TRIM_PKGVAR}/qwenpaw.pid"
-if [ -f "${PID_FILE}" ]; then
-    log_msg "正在停止 QwenPaw 进程..."
-    pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill -TERM "${pid}"
-        count=0
-        while kill -0 "${pid}" 2>/dev/null && [ $count -lt 10 ]; do
-            sleep 1
-            count=$((count + 1))
-        done
-        kill -KILL "${pid}" 2>/dev/null
-    fi
-    rm -f "${PID_FILE}"
+lock_dir="${TRIM_PKGVAR}/qwenpaw-upgrade.lock"
+if ! mkdir "${lock_dir}" 2>/dev/null; then
+    qwenpaw_report_error "已有升级任务正在运行"
+    exit 1
 fi
+trap 'rmdir "${lock_dir}" 2>/dev/null || true' EXIT
 
-rm -rf "${VENV_DIR}"
-"${PYTHON_BIN}" -m venv "${VENV_DIR}"
-chmod -R 755 "${VENV_DIR}"
+qwenpaw_has_newer_pypi_runtime
+version_status=$?
+case "${version_status}" in
+    0)
+        echo "保留控制台安装的较新 QwenPaw 版本"
+        exit 0
+        ;;
+    1) ;;
+    *)
+        qwenpaw_report_error "无法确认现有运行环境版本，已停止升级"
+        exit 1
+        ;;
+esac
 
-log_msg "正在激活虚拟环境..."
-source "${VENV_DIR}/bin/activate"
-log_msg "虚拟环境激活成功"
-
-PYPI_MIRROR="${wizard_pypi_mirror:-tsinghua}"
-PIP_OPTS=""
-
-if [ "$PYPI_MIRROR" = "tsinghua" ]; then
-    PIP_OPTS="-i https://pypi.tuna.tsinghua.edu.cn/simple"
-elif [ "$PYPI_MIRROR" = "aliyun" ]; then
-    PIP_OPTS="-i https://mirrors.aliyun.com/pypi/simple/"
-elif [ "$PYPI_MIRROR" = "ustc" ]; then
-    PIP_OPTS="-i https://pypi.mirrors.ustc.edu.cn/simple/"
+if ! qwenpaw_prepare_runtime bundle "${wizard_pypi_mirror:-tsinghua}"; then
+    exit 1
 fi
-
-cd "${CODE_DIR}"
-
-log_msg "正在安装 QwenPaw (源码模式)..."
-PIP_LOG=$(mktemp)
-if ! pip3 install -e . $PIP_OPTS > "${PIP_LOG}" 2>&1; then
-    cat "${PIP_LOG}" >> "${LOG_FILE}"
-    ERROR_MSG=$(tail -n 1 "${PIP_LOG}")
-    rm -f "${PIP_LOG}"
-    handle_error
+pid_file="${TRIM_PKGVAR}/qwenpaw.pid"
+if [ -f "${pid_file}" ]; then
+    IFS= read -r pid < "${pid_file}" || true
+    case "${pid:-}" in
+        ''|*[!0-9]*) qwenpaw_report_error "服务进程记录无效"; exit 1 ;;
+        *)
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -TERM "${pid}" || exit 1
+                count=0
+                while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 15 ]; do
+                    sleep 1
+                    count=$((count + 1))
+                done
+                if kill -0 "${pid}" 2>/dev/null; then
+                    qwenpaw_report_error "旧服务未停止，已取消升级"
+                    exit 1
+                fi
+            fi
+            rm -f "${pid_file}"
+            ;;
+    esac
 fi
-cat "${PIP_LOG}" >> "${LOG_FILE}"
-rm -f "${PIP_LOG}"
-
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${WORKING_DIR}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGETC}"
-chmod -R 755 "${WORKING_DIR}"
-
-log_msg "QwenPaw 升级成功！"
-exit 0
+if ! qwenpaw_snapshot_data; then
+    qwenpaw_report_error "数据快照失败，已取消切换"
+    exit 1
+fi
+if ! qwenpaw_prepare_channels "${wizard_pypi_mirror:-tsinghua}"; then
+    qwenpaw_report_error "旧频道依赖准备失败，已取消切换"
+    exit 1
+fi
+if ! qwenpaw_activate_runtime; then
+    exit 1
+fi
+echo "新运行环境已准备完成，旧环境和用户数据未删除"

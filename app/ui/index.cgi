@@ -12,7 +12,7 @@
 # 　许可证: MIT
 
 # 【注意】修改你自己的静态文件根目录，以本应用为例：
-BASE_PATH="/var/apps/com.dustinky.qwenpaw/target/www"
+BASE_PATH="${TRIM_APPDEST:-/var/apps/com.dustinky.qwenpaw/target}/www"
 
 # 1. 从 REQUEST_URI 里拿到 index.cgi 后面的路径
 #    例如：/cgi/ThirdParty/com.dustinky.qwenpaw/index.cgi/index.html?foo=bar   
@@ -50,11 +50,16 @@ fi
 
 # 2. 判断文件是否存在
 if [ ! -f "$TARGET_FILE" ]; then
-    echo "Status: 404 Not Found"
-    echo "Content-Type: text/plain; charset=utf-8"
-    echo ""
-    echo "404 Not Found: ${REL_PATH}"
-    exit 0
+    case "${REL_PATH%/}" in
+        /files|/logs|/tunnel|/about) TARGET_FILE="${BASE_PATH}/index.html" ;;
+        *)
+            echo "Status: 404 Not Found"
+            echo "Content-Type: text/plain; charset=utf-8"
+            echo ""
+            echo "404 Not Found: ${REL_PATH}"
+            exit 0
+            ;;
+    esac
 fi
 
 # 3. 根据扩展名简单判断 Content-Type

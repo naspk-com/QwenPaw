@@ -1,16 +1,20 @@
 #!/bin/bash
 
-LOG_FILE="/var/apps/com.dustinky.qwenpaw/var/qwenpaw.log"
-PID_FILE="/var/apps/com.dustinky.qwenpaw/var/qwenpaw.pid"
-UPGRADE_LOG_FILE="/var/apps/com.dustinky.qwenpaw/var/qwenpaw-upgrade.log"
-UPGRADE_PID_FILE="/var/apps/com.dustinky.qwenpaw/var/qwenpaw-upgrade.pid"
-UPGRADE_LOCK_DIR="/var/apps/com.dustinky.qwenpaw/var/qwenpaw-upgrade.lock"
-STATUS_CACHE_FILE="/var/apps/com.dustinky.qwenpaw/var/qwenpaw-status.cache"
+APP_BASE="${QWENPAW_APP_BASE:-/var/apps/com.dustinky.qwenpaw}"
+if ! source "${TRIM_APPDEST:-${APP_BASE}/target}/qwenpaw/runtime.sh" || ! qwenpaw_setup; then
+    echo "Status: 503 Service Unavailable"
+    echo "Content-Type: application/json; charset=utf-8"
+    echo ""
+    echo '{"success":false,"message":"运行环境初始化失败，请检查应用运行环境和权限"}'
+    exit 0
+fi
+LOG_FILE="${TRIM_PKGVAR}/qwenpaw.log"
+PID_FILE="${TRIM_PKGVAR}/qwenpaw.pid"
+UPGRADE_LOG_FILE="${TRIM_PKGVAR}/qwenpaw-upgrade.log"
+UPGRADE_PID_FILE="${TRIM_PKGVAR}/qwenpaw-upgrade.pid"
+UPGRADE_LOCK_DIR="${TRIM_PKGVAR}/qwenpaw-upgrade.lock"
+STATUS_CACHE_FILE="${TRIM_PKGVAR}/qwenpaw-status.cache"
 STATUS_CACHE_TTL=60
-
-AUTH_FILE="/var/apps/com.dustinky.qwenpaw/shares/com.dustinky.qwenpaw/.qwenpaw.secret/auth.json"
-
-VENV_DIR="/var/apps/com.dustinky.qwenpaw/home/venv"
 
 mkdir -p "$(dirname "${LOG_FILE}")"
 
@@ -53,33 +57,38 @@ invalidate_status_cache() {
 read_log_file_json() {
     local log_file="$1"
     local lines="$2"
+    local python="${VENV_DIR}/bin/python3"
 
     if [ ! -f "${log_file}" ]; then
-        echo ""
+        echo '{"success":true,"logs":[],"missing":true}'
         return
     fi
 
-    if [ -f "${VENV_DIR}/bin/python3" ]; then
-        source "${VENV_DIR}/bin/activate" 2>/dev/null
-        python3 -c "
-import json, sys, re
-ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-lines = []
-try:
-    with open('${log_file}') as f:
-        all_lines = f.readlines()
-        tailed = all_lines[-${lines}:] if len(all_lines) > ${lines} else all_lines
-    for line in tailed:
-        stripped = ansi_escape.sub('', line.rstrip('\n'))
-        if stripped.strip():
-            lines.append({'level': 'info', 'time': '', 'message': stripped})
-    print(json.dumps({'success': True, 'logs': lines}))
-except Exception as e:
-    print(json.dumps({'success': True, 'logs': [], 'message': str(e)}))
-" 2>/dev/null
-    else
-        echo '{"success":true,"logs":[]}'
+    [ -x "${python}" ] || python="/var/apps/python312/target/bin/python3"
+    if [ ! -x "${python}" ]; then
+        echo '{"success":false,"message":"无法读取日志：Python 运行环境不可用"}'
+        return
     fi
+
+    "${python}" - "${log_file}" "${lines}" <<'PY'
+import json
+import re
+import sys
+from collections import deque
+
+ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+try:
+    with open(sys.argv[1], encoding='utf-8', errors='replace') as source:
+        tailed = deque(source, maxlen=int(sys.argv[2]))
+    logs = [
+        {'message': text}
+        for line in tailed
+        if (text := ansi_escape.sub('', line.rstrip('\r\n'))).strip()
+    ]
+    print(json.dumps({'success': True, 'logs': logs}, ensure_ascii=False))
+except OSError:
+    print(json.dumps({'success': False, 'message': '无法读取日志，请检查文件权限'}, ensure_ascii=False))
+PY
 }
 
 get_status() {
@@ -111,12 +120,42 @@ get_status() {
     echo "Content-Type: application/json"
     echo ""
 
-    local auth_enabled=false
-    if [ -f "${AUTH_FILE}" ]; then
-        auth_enabled=true
-    fi
+    local python="${VENV_DIR}/bin/python3" secret_dir=""
+    [ -x "${python}" ] || python="/var/apps/python312/target/bin/python3"
+    secret_dir="$(get_secret_dir 2>/dev/null)" || secret_dir=""
+    "${python}" - "${running}" "${pid}" "${start_at}" "${version:-未知}" \
+        "${QWENPAW_AUTH_ENABLED:-}" "${secret_dir}" \
+        "${TRIM_SERVICE_PORT}" "${QWENPAW_WORKING_DIR}" "${TRIM_APPDEST}/qwenpaw" <<'PY'
+import json
+import os
+import sys
 
-    echo "{\"success\":true,\"running\":${running},\"pid\":\"${pid}\",\"startAt\":${start_at},\"version\":\"${version:-未知}\",\"authEnabled\":${auth_enabled}}"
+running, pid, start, version, auth, secret, port, workdir, app_dir = sys.argv[1:]
+sys.path.insert(0, app_dir)
+from fnos_api import convert_path
+
+configured = None
+if secret:
+    try:
+        with open(os.path.join(secret, "auth.json"), encoding="utf-8") as f:
+            configured = bool(json.load(f).get("user"))
+    except FileNotFoundError:
+        configured = False
+    except (OSError, ValueError, AttributeError):
+        pass
+print(json.dumps({
+    "success": True,
+    "running": running == "true",
+    "pid": pid,
+    "startAt": int(start) if start.isdigit() else None,
+    "version": version,
+    "authEnabled": auth.strip().lower() in ("true", "1", "yes"),
+    "authConfigured": configured,
+    "port": int(port) if port.isdigit() else None,
+    "workingDir": workdir,
+    "workingDirDisplay": convert_path(workdir),
+}, ensure_ascii=False))
+PY
 }
 
 status() {
@@ -143,8 +182,9 @@ start_service() {
         fi
     fi
 
-    local cmd="export HOME=/var/apps/com.dustinky.qwenpaw/home && export QWENPAW_WORKING_DIR=/var/apps/com.dustinky.qwenpaw/shares/com.dustinky.qwenpaw/.qwenpaw && export QWENPAW_AUTH_ENABLED=true && export PATH=/var/apps/nodejs_v24/target/bin:\$PATH && source ${VENV_DIR}/bin/activate && python3 -m qwenpaw app --host 0.0.0.0 --port 19091"
-    nohup bash -c "${cmd}" >> "${LOG_FILE}" 2>&1 &
+    nohup "${VENV_DIR}/bin/python3" "${TRIM_APPDEST}/qwenpaw/compat.py" \
+        app --host 0.0.0.0 --port "${TRIM_SERVICE_PORT}" \
+        --log-level "${QWENPAW_LOG_LEVEL}" >> "${LOG_FILE}" 2>&1 &
     echo $! > "${PID_FILE}"
 
     sleep 2
@@ -225,8 +265,9 @@ restart_service() {
         rm -f "${PID_FILE}"
     fi
 
-    local cmd="export HOME=/var/apps/com.dustinky.qwenpaw/home && export QWENPAW_WORKING_DIR=/var/apps/com.dustinky.qwenpaw/shares/com.dustinky.qwenpaw/.qwenpaw && export QWENPAW_AUTH_ENABLED=true && export PATH=/var/apps/nodejs_v24/target/bin:\$PATH && source ${VENV_DIR}/bin/activate && python3 -m qwenpaw app --host 0.0.0.0 --port 19091"
-    nohup bash -c "${cmd}" >> "${LOG_FILE}" 2>&1 &
+    nohup "${VENV_DIR}/bin/python3" "${TRIM_APPDEST}/qwenpaw/compat.py" \
+        app --host 0.0.0.0 --port "${TRIM_SERVICE_PORT}" \
+        --log-level "${QWENPAW_LOG_LEVEL}" >> "${LOG_FILE}" 2>&1 &
     echo $! > "${PID_FILE}"
 
     sleep 2
@@ -275,68 +316,14 @@ upgrade_service() {
     fi
 
     local mirror=""
-    local mirror_url=""
 
     if echo "$QUERY_STRING$REQUEST_URI" | grep -q "mirror="; then
         mirror=$(echo "$QUERY_STRING$REQUEST_URI" | sed 's/.*mirror=\([^&]*\).*/\1/')
     fi
 
-    case "$mirror" in
-        tsinghua)
-            mirror_url="-i https://pypi.tuna.tsinghua.edu.cn/simple"
-            ;;
-        aliyun)
-            mirror_url="-i https://mirrors.aliyun.com/pypi/simple"
-            ;;
-        ustc)
-            mirror_url="-i https://pypi.mirrors.ustc.edu.cn/simple"
-            ;;
-    esac
-
     > "${UPGRADE_LOG_FILE}"
-
-    local upgrade_cmd="source ${VENV_DIR}/bin/activate && PYTHONUNBUFFERED=1 pip install --upgrade qwenpaw ${mirror_url} 2>&1"
-
-    nohup bash -c "
-        echo '=== QwenPaw 升级开始 ===' >> ${UPGRADE_LOG_FILE}
-        echo '时间: $(date)' >> ${UPGRADE_LOG_FILE}
-        echo '' >> ${UPGRADE_LOG_FILE}
-        ${upgrade_cmd} >> ${UPGRADE_LOG_FILE} 2>&1
-        rc=\$?
-        echo '' >> ${UPGRADE_LOG_FILE}
-        if [ \$rc -eq 0 ]; then
-            echo '=== 升级成功 ===' >> ${UPGRADE_LOG_FILE}
-            rm -f ${STATUS_CACHE_FILE}
-            echo '正在重启 QwenPaw...' >> ${UPGRADE_LOG_FILE}
-            if [ -f ${PID_FILE} ]; then
-                old_pid=\$(head -n 1 ${PID_FILE} | tr -d '[:space:]')
-                if kill -0 \${old_pid} 2>/dev/null; then
-                    kill -TERM \${old_pid}
-                    count=0
-                    while kill -0 \${old_pid} 2>/dev/null && [ \$count -lt 10 ]; do
-                        sleep 1
-                        count=\$((count + 1))
-                    done
-                    if kill -0 \${old_pid} 2>/dev/null; then
-                        kill -KILL \${old_pid}
-                    fi
-                fi
-                rm -f ${PID_FILE}
-            fi
-            export HOME=/var/apps/com.dustinky.qwenpaw/home
-            export QWENPAW_WORKING_DIR=/var/apps/com.dustinky.qwenpaw/shares/com.dustinky.qwenpaw/.qwenpaw
-            export QWENPAW_AUTH_ENABLED=true
-            export PATH=/var/apps/nodejs_v24/target/bin:\$PATH
-            source ${VENV_DIR}/bin/activate
-            python3 -m qwenpaw app --host 0.0.0.0 --port 19091 >> ${LOG_FILE} 2>&1 &
-            echo \$! > ${PID_FILE}
-            echo 'QwenPaw 已重启' >> ${UPGRADE_LOG_FILE}
-        else
-            echo '=== 升级失败 (exit code: '\$rc') ===' >> ${UPGRADE_LOG_FILE}
-        fi
-        rm -f ${UPGRADE_PID_FILE}
-        rm -rf ${UPGRADE_LOCK_DIR}
-    " &
+    nohup bash "${TRIM_APPDEST}/qwenpaw/console-upgrade.sh" "${mirror}" \
+        >> "${UPGRADE_LOG_FILE}" 2>&1 &
     echo $! > "${UPGRADE_PID_FILE}"
 
     sleep 1
@@ -388,6 +375,18 @@ clear_logs() {
     echo "{\"success\":true,\"message\":\"日志已清空\"}"
 }
 
+get_secret_dir() {
+    "${VENV_DIR}/bin/python3" - "${TRIM_APPDEST}/qwenpaw" <<'PY'
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from snapshot import data_paths
+_, secret = data_paths(os.environ, Path(sys.argv[1]) / "code" / ".env")
+print(secret)
+PY
+}
+
 reset_auth() {
     if [ "$REQUEST_METHOD" != "POST" ]; then
         echo "Content-Type: application/json"
@@ -396,8 +395,16 @@ reset_auth() {
         exit 0
     fi
 
-    if [ -f "${AUTH_FILE}" ]; then
-        rm -f "${AUTH_FILE}"
+    local secret_dir auth_file
+    if ! secret_dir="$(get_secret_dir)"; then
+        echo "Content-Type: application/json"
+        echo ""
+        echo '{"success":false,"message":"无法确定密钥目录，未修改认证文件"}'
+        return
+    fi
+    auth_file="${secret_dir}/auth.json"
+    if [ -f "${auth_file}" ]; then
+        rm -f "${auth_file}"
         echo "Content-Type: application/json"
         echo ""
         echo "{\"success\":true,\"message\":\"密码已重置，下次进入 QwenPaw 时将重新设置账号密码\"}"
@@ -422,11 +429,16 @@ check_tunnel_installed() {
 }
 
 backup_download() {
-    local working_base="/var/apps/com.dustinky.qwenpaw/shares/com.dustinky.qwenpaw"
-    local working_dir="${working_base}/.qwenpaw"
-    local secret_dir="${working_base}/.qwenpaw.secret"
+    local working_dir="${QWENPAW_WORKING_DIR}"
+    local secret_dir
+    if ! secret_dir="$(get_secret_dir)"; then
+        echo "Content-Type: application/json"
+        echo ""
+        echo '{"success":false,"message":"无法确定密钥目录，无法备份"}'
+        return
+    fi
     local backup_name="qwenpaw-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    local tmp_file="/tmp/${backup_name}"
+    local tmp_file
 
     if [ ! -d "${working_dir}" ]; then
         echo "Content-Type: application/json"
@@ -442,7 +454,15 @@ backup_download() {
         exit 0
     fi
 
-    if ! tar -czf "${tmp_file}" -C "${working_base}" ".qwenpaw" ".qwenpaw.secret" 2>/dev/null; then
+    if ! tmp_file="$(mktemp "${TMPDIR:-/tmp}/qwenpaw-backup.XXXXXXXX")"; then
+        echo "Content-Type: application/json"
+        echo ""
+        echo '{"success":false,"message":"无法创建临时备份文件"}'
+        return
+    fi
+    if ! tar -czf "${tmp_file}" \
+        -C "$(dirname "${working_dir}")" "$(basename "${working_dir}")" \
+        -C "$(dirname "${secret_dir}")" "$(basename "${secret_dir}")" 2>/dev/null; then
         echo "Content-Type: application/json"
         echo ""
         echo "{\"success\":false,\"message\":\"打包失败，请检查磁盘空间和权限\"}"

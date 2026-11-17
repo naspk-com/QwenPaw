@@ -11,6 +11,7 @@ const { themeMode, getSystemTheme } = useTheme()
 const systemTheme = ref(getSystemTheme())
 const bilibiliQrUrl = ref('')
 const douyinQrUrl = ref('')
+const publicBase = import.meta.env.BASE_URL
 
 const isDark = computed(() => {
   return themeMode.value === 'system' ? systemTheme.value === 'dark' : themeMode.value === 'dark'
@@ -142,7 +143,7 @@ onMounted(() => {
     <div class="text-center space-y-4">
       <div class="w-28 h-28 mx-auto">
         <img
-          src="/favicon.png"
+          :src="`${publicBase}favicon.png`"
           alt="Logo"
           class="w-full h-full object-contain"
         >
@@ -189,6 +190,17 @@ onMounted(() => {
               block
             >
               访问官网 www.dustinky.com
+            </UButton>
+            <UButton
+              to="https://qm.qq.com/q/zXE0IqZtII"
+              target="_blank"
+              color="neutral"
+              variant="outline"
+              icon="i-lucide-users"
+              class="mt-2"
+              block
+            >
+              加入 QQ 交流群
             </UButton>
           </div>
         </div>
@@ -247,7 +259,7 @@ onMounted(() => {
         <div class="text-center space-y-4">
           <div class="relative inline-block">
             <img
-              :src="isDark ? 'donate-dark.png' : 'donate-light.png'"
+              :src="`${publicBase}${isDark ? 'donate-dark.png' : 'donate-light.png'}`"
               alt="微信赞赏码"
               class="w-full mx-auto rounded-lg"
             >
@@ -345,7 +357,7 @@ onMounted(() => {
         <div class="flex flex-col items-center gap-6">
           <div class="relative flex-shrink-0">
             <img
-              src="/wechat-qrcode.png"
+              :src="`${publicBase}wechat-qrcode.png`"
               alt="微信公众号二维码"
               class="w-full"
             >

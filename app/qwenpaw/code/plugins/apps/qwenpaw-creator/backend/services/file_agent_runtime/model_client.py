@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import asyncio
 import inspect
 import json
 import os
 import re
+from time import monotonic
 
 from typing import Any, Protocol
 
@@ -34,6 +36,7 @@ from agentscope.model import ChatModelBase, DashScopeChatModel
 
 from models import config as model_config
 from models.concurrency import model_slot
+from models.output_budget import anthropic_output_limit
 from models.dashscope_multimodal import DashScopeNativeFormatter
 from models.native_content import native_content_blocks
 from services.media_files.transient_errors import is_transient_error_message
@@ -105,6 +108,55 @@ _HTTP_STATUS_PATTERN = re.compile(
 
 MAX_RATE_LIMIT_RETRIES = 5
 MAX_TRANSIENT_MODEL_RETRIES = 4
+
+
+class _ThinkingDeltaBuffer:
+    """Bound synchronous trace writes while keeping the full thinking text."""
+
+    def __init__(self, callback: AgentTextDeltaCallback | None):
+        self.callback = callback
+        self.parts: list[str] = []
+        self.size = 0
+        self.last_flush: float | None = None
+
+    async def feed(self, delta: str) -> None:
+        self.parts.append(delta)
+        self.size += len(delta)
+        if (
+            self.last_flush is None
+            or self.size >= 1024
+            or monotonic() - self.last_flush >= 0.5
+        ):
+            await self.flush()
+
+    async def flush(self) -> None:
+        if not self.parts:
+            return
+        delta = "".join(self.parts)
+        # A callback failure must not replay the same delta or model request.
+        self.parts.clear()
+        self.size = 0
+        if self.callback is not None:
+            await self.callback(delta)
+        self.last_flush = monotonic()
+
+
+@asynccontextmanager
+async def _buffered_thinking(callback: AgentTextDeltaCallback | None):
+    buffer = _ThinkingDeltaBuffer(callback)
+    try:
+        yield buffer
+    except (
+        asyncio.CancelledError,
+        AgentStreamCallbackError,
+        AgentStreamCallbackPassthrough,
+    ):
+        # Cancellation and persistence failures remain immediate boundaries.
+        raise
+    except Exception:
+        await buffer.flush()
+        raise
+    await buffer.flush()
 
 
 def is_rate_limit_error_text(exc_text: str) -> bool:
@@ -660,6 +712,19 @@ def _build_chat_model(
             formatter=formatter,
             client_kwargs=gemini_kwargs,
         )
+    # Drop the sampling temperature for models whose gateway rejects an
+    # explicit value (e.g. DashScope ``kimi-k3``); AgentScope omits a
+    # ``None`` temperature so the provider applies its own default. Only the
+    # OpenAI-compatible/DashScope path reaches here: Anthropic and Gemini
+    # return above and their ``Parameters`` differ.
+    parameters = parameters.model_copy(
+        update={
+            "temperature": model_config.chat_temperature(
+                model_name,
+                parameters.temperature,
+            ),
+        },
+    )
     return DashScopeChatModel(
         credential=DashScopeCredential(
             api_key=api_key,
@@ -711,13 +776,9 @@ class AgentScopeAgentChatClient:
         # Shares default_model_turn_timeout_seconds with the driver turn
         # budget so the transport timeout never undercuts it.
         timeout_seconds: float = DEFAULT_MODEL_TURN_TIMEOUT_SECONDS,
-        # ``None`` omits the parameter entirely so the provider/model keeps
-        # control over its own output budget.
-        max_tokens: int | None = None,
         temperature: float = 0.2,
     ) -> None:
         self.timeout_seconds = timeout_seconds
-        self.max_tokens = max_tokens
         self.temperature = temperature
         self._injected = model is not None
         self._configuration: tuple[str, str, str, str] | None = None
@@ -762,7 +823,6 @@ class AgentScopeAgentChatClient:
                 from agentscope.model import AnthropicChatModel
 
                 parameters = AnthropicChatModel.Parameters(
-                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
                 )
                 self.model = _build_chat_model(
@@ -777,7 +837,6 @@ class AgentScopeAgentChatClient:
                 from agentscope.model import GeminiChatModel
 
                 parameters = GeminiChatModel.Parameters(
-                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
                 )
                 self.model = _build_chat_model(
@@ -790,7 +849,6 @@ class AgentScopeAgentChatClient:
                 )
             else:
                 parameters = DashScopeChatModel.Parameters(
-                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     thinking_enable=True,
                     parallel_tool_calls=False,
@@ -852,8 +910,29 @@ class AgentScopeAgentChatClient:
         provider_tool_chunk_counts: dict[str, int] = {}
 
         try:
-            async with model_slot("text"):
-                response = await self._configured_model()(
+            async with model_slot("text"), _buffered_thinking(
+                guarded_thinking_delta,
+            ) as thinking_buffer:
+                configured = self._configured_model()
+                if not self._injected and self._configuration is not None:
+                    (
+                        api_key,
+                        base_url,
+                        model_name,
+                        protocol,
+                    ) = self._configuration
+                    if (
+                        model_config.is_anthropic_protocol(protocol)
+                        and configured.parameters.max_tokens is None
+                    ):
+                        configured.parameters.max_tokens = (
+                            await anthropic_output_limit(
+                                model_name,
+                                base_url=base_url,
+                                api_key=api_key,
+                            )
+                        )
+                response = await configured(
                     native_messages,
                     tools=[dict(item) for item in tools] or None,
                 )
@@ -864,6 +943,8 @@ class AgentScopeAgentChatClient:
                             final = item
                             continue
                         for block in item.content:
+                            if not isinstance(block, ThinkingBlock):
+                                await thinking_buffer.flush()
                             if isinstance(block, TextBlock):
                                 if block.text:
                                     await text_stream.feed(block.text)
@@ -872,7 +953,7 @@ class AgentScopeAgentChatClient:
                                     block.thinking
                                     and guarded_thinking_delta is not None
                                 ):
-                                    await guarded_thinking_delta(
+                                    await thinking_buffer.feed(
                                         block.thinking,
                                     )
                                     streamed_thinking = True
@@ -992,6 +1073,21 @@ class AgentScopeAgentChatClient:
             raise
         except Exception as exc:
             exc_text = str(exc)
+            if model_config.is_temperature_unsupported_error(exc_text):
+                # The AgentScope SDK path cannot cheaply re-issue the turn
+                # here, so learn the refusal and drop the cached model. Its
+                # parameters still carry the rejected temperature, and
+                # _configured_model() rebuilds only when the configuration
+                # tuple changes, which the capability flip does not do; the
+                # next turn then rebuilds via _build_chat_model, which omits
+                # the field via chat_temperature.
+                model_config.learn_temperature_unsupported(
+                    getattr(self.model, "model", "")
+                    or model_config.get_text_model_name(),
+                )
+                if not self._injected:
+                    self.model = None
+                    self._configuration = None
             if is_context_length_error(exc) and _context_retries_remaining:
                 # A context 400 is deterministic. Retry only after producing
                 # a strictly smaller valid context, never as rate limiting.
@@ -1396,7 +1492,6 @@ class AgentScopeVlmChatClient(AgentScopeAgentChatClient):
                 from agentscope.model import AnthropicChatModel
 
                 parameters = AnthropicChatModel.Parameters(
-                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
                 )
                 self.model = _build_chat_model(
@@ -1411,7 +1506,6 @@ class AgentScopeVlmChatClient(AgentScopeAgentChatClient):
                 from agentscope.model import GeminiChatModel
 
                 parameters = GeminiChatModel.Parameters(
-                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
                 )
                 self.model = _build_chat_model(
@@ -1424,7 +1518,6 @@ class AgentScopeVlmChatClient(AgentScopeAgentChatClient):
                 )
             else:
                 parameters = DashScopeChatModel.Parameters(
-                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     thinking_enable=True,
                     parallel_tool_calls=False,

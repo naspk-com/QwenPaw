@@ -15,6 +15,7 @@ from typing import Optional
 from models.concurrency import model_slot
 from models import config as model_config
 from models.provider_tasks import note_provider_task
+from models.reference_audio import wan_voice_excerpt
 from models.media_transport import (
     SEEDANCE_REFERENCE_IMAGE_MAX_BYTES,
     read_reference_media,
@@ -58,7 +59,7 @@ from models.video_backends import minimax as minimax_backend
 from models.video_backends import minimax_sglang as minimax_sglang_backend
 from models.video_backends import veo as veo_backend
 from models.video_backends import vidu as vidu_backend
-from utils.paths import media_path_from_url
+from utils.paths import local_path_from_file_url, media_path_from_url
 from utils.logger import setup_logger
 from utils.exceptions import ModelError
 
@@ -126,8 +127,7 @@ async def _resolve_reference_media_url(
             or f"reference-{uuid.uuid4().hex}.bin"
         )
     elif url.startswith("file://"):
-        parsed = urlparse(url)
-        media_path = Path(parsed.path)
+        media_path = local_path_from_file_url(url)
         filename = media_path.name or f"reference-{uuid.uuid4().hex}.bin"
     elif url.startswith(("http://", "https://")):
         filename = (
@@ -162,7 +162,7 @@ async def _resolve_reference_media_url(
             media_path = (
                 media_path_from_url(url)
                 if url.startswith("/generated/")
-                else Path(urlparse(url).path)
+                else local_path_from_file_url(url)
             )
             resolved_url = await upload_local_file_to_dashscope_temp(
                 media_path,
@@ -203,6 +203,28 @@ async def _resolve_reference_media_url(
             f"Reference media transport failed for {filename}: {exc}",
             model_name=model_name,
         ) from exc
+
+
+async def _resolve_reference_media_urls(
+    urls: list[str],
+    backend: str,
+) -> list[tuple[str, str]]:
+    """Upload independent references concurrently without changing numbering."""
+    slots = asyncio.Semaphore(3)
+
+    async def resolve(url):
+        async with slots:
+            return await _resolve_reference_media_url(url, backend)
+
+    tasks = [asyncio.create_task(resolve(url)) for url in urls]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        # No upload should outlive a cancelled/failed generation admission.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 def _seedance_spec(model_name: str) -> tuple[frozenset[str], int, int, bool]:
@@ -592,6 +614,7 @@ async def submit_video_task(
     first_frame_url: Optional[str] = None,
     video_url: Optional[str] = None,
     reference_voice_urls: Optional[list[str]] = None,
+    preserve_reference_slots: bool = False,
 ) -> str:
     """Submit a video generation task and return its task_id.
 
@@ -654,9 +677,30 @@ async def submit_video_task(
     )
     unique_references = [
         item.strip()
-        for item in dict.fromkeys(all_images)
+        for item in (
+            all_images
+            if preserve_reference_slots
+            else dict.fromkeys(all_images)
+        )
         if item and item.strip()
     ]
+    # File-native execution already deduplicates version IDs. Distinct
+    # versions may share bytes/URLs but still occupy authored [Image N] slots.
+    all_voices = ([""] if reference_image_url else []) + [
+        (reference_voice_urls[index] or "").strip()
+        if reference_voice_urls and index < len(reference_voice_urls)
+        else ""
+        for index, _ in enumerate(reference_image_url_list or [])
+    ]
+    slot_voices = (
+        [
+            voice
+            for item, voice in zip(all_images, all_voices)
+            if item and item.strip()
+        ]
+        if preserve_reference_slots
+        else [voice_by_reference.get(item, "") for item in unique_references]
+    )
     uses_happyhorse = not uses_seedance and backend_key == "happyhorse"
     uses_wan3 = backend_key == "wan" and is_wan3_video_model(model_name)
 
@@ -792,11 +836,16 @@ async def submit_video_task(
                 model_name=effective_model,
             )
         media.append({"type": "video", "url": resolved_video})
-        for img_url in unique_references:
-            resolved_url, media_kind = await _resolve_reference_media_url(
-                img_url,
-                upload_backend,
-            )
+        resolved_references = await _resolve_reference_media_urls(
+            unique_references,
+            upload_backend,
+        )
+        for index, (img_url, (resolved_url, media_kind)) in enumerate(
+            zip(
+                unique_references,
+                resolved_references,
+            ),
+        ):
             if media_kind != "image":
                 raise ModelError(
                     "video_edit reference media must be images: "
@@ -817,11 +866,16 @@ async def submit_video_task(
             )
         voice_shape, voice_budget = voice_support or ("", 0)
         standalone_voices: list[str] = []
-        for img_url in unique_references:
-            resolved_url, media_kind = await _resolve_reference_media_url(
-                img_url,
-                upload_backend,
-            )
+        resolved_references = await _resolve_reference_media_urls(
+            unique_references,
+            upload_backend,
+        )
+        for index, (img_url, (resolved_url, media_kind)) in enumerate(
+            zip(
+                unique_references,
+                resolved_references,
+            ),
+        ):
             if media_kind == "audio":
                 raise ModelError(
                     "audio files cannot be sent as image/video references; "
@@ -844,7 +898,7 @@ async def submit_video_task(
                 ),
                 "url": resolved_url,
             }
-            voice_url = voice_by_reference.get(img_url)
+            voice_url = slot_voices[index]
             if voice_url and voice_shape:
                 if voice_shape == REFERENCE_VOICE_PER_MEDIA:
                     (
@@ -868,20 +922,33 @@ async def submit_video_task(
             media.append(entry)
         if voice_shape == REFERENCE_VOICE_STANDALONE and standalone_voices:
             if len(standalone_voices) > voice_budget:
-                logger.info(
-                    "Reference voices truncated to the %s cap of %d",
-                    effective_model,
-                    voice_budget,
+                raise ModelError(
+                    f"{effective_model} accepts at most {voice_budget} "
+                    "reference voices; split the dialogue into fewer speakers",
+                    model_name=effective_model,
+                    retryable=False,
                 )
-                standalone_voices = standalone_voices[:voice_budget]
             for voice_url in standalone_voices:
-                (
-                    resolved_voice,
-                    voice_kind,
-                ) = await _resolve_reference_media_url(
-                    voice_url,
-                    upload_backend,
-                )
+                if is_wan3_video_model(effective_model):
+                    async with wan_voice_excerpt(
+                        voice_url,
+                        voice_count=len(standalone_voices),
+                    ) as excerpt:
+                        (
+                            resolved_voice,
+                            voice_kind,
+                        ) = await _resolve_reference_media_url(
+                            excerpt,
+                            upload_backend,
+                        )
+                else:
+                    (
+                        resolved_voice,
+                        voice_kind,
+                    ) = await _resolve_reference_media_url(
+                        voice_url,
+                        upload_backend,
+                    )
                 if voice_kind != "audio":
                     raise ModelError(
                         "reference voice must be an audio file: "
@@ -892,6 +959,29 @@ async def submit_video_task(
                 # it into an audio_url content item.
                 media.append(
                     {"type": "reference_audio", "url": resolved_voice},
+                )
+            if is_wan3_video_model(effective_model):
+                # Standalone audio loses the per-image attachment used by
+                # Wan2.7. Restore its meaning using the actual wire order.
+                mappings = []
+                ordinals = {"reference_image": 0, "reference_video": 0}
+                for index, (_reference_url, item) in enumerate(
+                    zip(unique_references, media),
+                ):
+                    kind = item["type"]
+                    ordinals[kind] += 1
+                    label = "图" if kind == "reference_image" else "视频"
+                    voice_url = slot_voices[index]
+                    if voice_url in standalone_voices:
+                        audio_index = standalone_voices.index(voice_url) + 1
+                        mappings.append(
+                            f"{label}{ordinals[kind]}中的角色使用音频{audio_index}的音色",
+                        )
+                prompt += (
+                    "\n\n角色参考音色对应关系（按本次实际发送顺序）："
+                    + "；".join(mappings)
+                    + "。音频只提供对应角色的声音身份；台词与演唱内容遵循本段"
+                    "剧本，不复述试听样本，不让其他角色使用该声音。"
                 )
 
     url = ""
@@ -1335,8 +1425,6 @@ async def check_task_status(task_id: str) -> dict:
                 timeout=model_config.get_video_status_timeout(),
                 model_name=model_name,
             )
-        except ModelError:
-            raise
         except httpx.TimeoutException:
             raise ModelError(
                 "Task status check timed out",

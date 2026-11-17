@@ -1,84 +1,32 @@
 #!/bin/bash
 
-PYTHON_BIN="/var/apps/python312/target/bin/python3"
-CODE_DIR="${TRIM_APPDEST}/qwenpaw/code"
-WORKING_DIR="${TRIM_PKGHOME}"
-VENV_DIR="${WORKING_DIR}/venv"
+source "${TRIM_APPDEST}/qwenpaw/runtime.sh" || exit 1
+qwenpaw_setup || exit 1
+exec >> "${TRIM_PKGVAR}/qwenpaw-install.log" 2>&1
+qwenpaw_save_log_level "${QWENPAW_LOG_LEVEL}" || exit 1
 
-export HOME="${WORKING_DIR}"
-export QWENPAW_WORKING_DIR="${TRIM_DATA_SHARE_PATHS%%:*}/.qwenpaw"
-LOG_FILE="${TRIM_PKGVAR}/qwenpaw-install.log"
-
-log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "${LOG_FILE}"
-}
-
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${WORKING_DIR}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGETC}"
-chmod -R 755 "${WORKING_DIR}"
-chmod -R 755 "${TRIM_PKGVAR}"
-chmod -R 755 "${TRIM_PKGETC}"
-
-MARKER="${TRIM_PKGHOME}/.qwenpaw_keep_runtime"
-if [ -f "${MARKER}" ]; then
-    log_msg "检测到保留运行环境标记，跳过安装，仅修正权限"
-    exit 0
+if [ -f "${TRIM_PKGHOME}/.qwenpaw_keep_runtime" ] && \
+    [ -x "${VENV_DIR}/bin/python3" ]; then
+    qwenpaw_has_newer_pypi_runtime
+    version_status=$?
+    case "${version_status}" in
+        0) echo "保留已有较新运行环境"; exit 0 ;;
+        1) ;;
+        *) qwenpaw_report_error "无法确认现有运行环境版本"; exit 1 ;;
+    esac
 fi
 
-log_msg "开始安装 QwenPaw..."
-
-log_msg "正在创建虚拟环境..."
-"${PYTHON_BIN}" -m venv "${VENV_DIR}"
-log_msg "虚拟环境 ${VENV_DIR} 创建成功"
-log_msg "正在设置虚拟环境权限..."
-chmod -R 755 "${VENV_DIR}"
-log_msg "虚拟环境 ${VENV_DIR} 权限设置成功"
-
-log_msg "正在激活虚拟环境..."
-source "${VENV_DIR}/bin/activate"
-log_msg "虚拟环境激活成功"
-
-PYPI_MIRROR="${wizard_pypi_mirror:-tsinghua}"
-PIP_OPTS=""
-
-if [ "$PYPI_MIRROR" = "tsinghua" ]; then
-    log_msg "使用清华源安装"
-    PIP_OPTS="-i https://pypi.tuna.tsinghua.edu.cn/simple"
-elif [ "$PYPI_MIRROR" = "aliyun" ]; then
-    log_msg "使用阿里云源安装"
-    PIP_OPTS="-i https://mirrors.aliyun.com/pypi/simple/"
-elif [ "$PYPI_MIRROR" = "ustc" ]; then
-    log_msg "使用中科大源安装"
-    PIP_OPTS="-i https://pypi.mirrors.ustc.edu.cn/simple/"
+if ! qwenpaw_prepare_runtime bundle "${wizard_pypi_mirror:-tsinghua}"; then
+    exit 1
 fi
-
-log_msg "正在升级虚拟环境 pip..."
-python3 -m pip install --upgrade pip $PIP_OPTS
-log_msg "虚拟环境 pip 升级成功"
-
-cd "${CODE_DIR}"
-
-log_msg "正在安装 QwenPaw (源码模式)..."
-PIP_LOG=$(mktemp)
-if ! pip3 install -e . $PIP_OPTS > "${PIP_LOG}" 2>&1; then
-    cat "${PIP_LOG}" >> "${LOG_FILE}"
-    ERROR_MSG=$(tail -n 1 "${PIP_LOG}")
-    rm -f "${PIP_LOG}"
-    handle_error
+if ! qwenpaw_activate_runtime; then
+    exit 1
 fi
-cat "${PIP_LOG}" >> "${LOG_FILE}"
-rm -f "${PIP_LOG}"
-
-log_msg "正在初始化 QwenPaw..."
-echo "Yes" | python3 -m qwenpaw init --defaults
-
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${WORKING_DIR}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}"
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGETC}"
-chmod -R 755 "${WORKING_DIR}"
-chmod -R 755 "${TRIM_PKGVAR}"
-chmod -R 755 "${TRIM_PKGETC}"
-
-log_msg "QwenPaw 安装成功！"
-exit 0
+if [ ! -f "${QWENPAW_WORKING_DIR}/config.json" ]; then
+    if ! "${VENV_DIR}/bin/python3" "${TRIM_APPDEST}/qwenpaw/compat.py" \
+        init --defaults --accept-security </dev/null; then
+        qwenpaw_report_error "初始化失败，保留已有数据"
+        exit 1
+    fi
+fi
+echo "QwenPaw 安装完成"

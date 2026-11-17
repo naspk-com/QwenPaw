@@ -7,7 +7,9 @@ import { resolve } from 'path'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const basePath = env.VITE_BASE_PATH || '/'
+  const basePath = env.VITE_BASE_PATH || (mode === 'production'
+    ? '/cgi/ThirdParty/com.dustinky.qwenpaw/index.cgi/'
+    : '/')
   
   return {
     plugins: [

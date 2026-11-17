@@ -7,12 +7,18 @@ interface QwenPawInfo {
   running?: boolean
   version?: string
   authEnabled?: boolean
+  authConfigured?: boolean | null
+  port?: number | null
+  workingDir?: string
+  workingDirDisplay?: string | null
 }
 const qwenpawInfo = ref<QwenPawInfo | null>(null)
 const running = ref(false)
+const statusAvailable = ref(false)
 const now = ref(Date.now())
 const version = ref('')
 let runtimeTimer: number | undefined
+let statusTimer: number | undefined
 
 const toast = useToast()
 const showNotification = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info') => {
@@ -33,12 +39,37 @@ const showNotification = (message: string, type: 'success' | 'error' | 'warning'
   toast.add({ title: message, color, icon })
 }
 
-const statusText = computed(() => running.value ? '运行中' : '已停止')
-const statusDescription = computed(() => running.value ? 'QwenPaw 服务正在运行' : 'QwenPaw 服务未运行')
-const statusIcon = computed(() => running.value ? 'i-lucide-activity' : 'i-lucide-stop-circle')
-const statusColor = computed(() => running.value ? 'success' : 'neutral')
+const statusText = computed(() => !statusAvailable.value ? '状态未知' : running.value ? '运行中' : '已停止')
+const statusDescription = computed(() => !statusAvailable.value ? '无法获取服务状态，请检查连接' : running.value ? 'QwenPaw 服务进程正在运行' : 'QwenPaw 服务未运行')
+const statusIcon = computed(() => !statusAvailable.value ? 'i-lucide-circle-help' : running.value ? 'i-lucide-activity' : 'i-lucide-stop-circle')
+const statusColor = computed(() => !statusAvailable.value ? 'warning' : running.value ? 'success' : 'neutral')
 
-const authEnabled = computed(() => qwenpawInfo.value?.authEnabled ?? false)
+const authText = computed(() => {
+  if (!statusAvailable.value || qwenpawInfo.value?.authEnabled == null) return '未知'
+  if (!qwenpawInfo.value.authEnabled) return '未启用'
+  if (qwenpawInfo.value.authConfigured === false) return '已启用，待设置账号'
+  if (qwenpawInfo.value.authConfigured === true) return '已启用，账号已设置'
+  return '已启用，账号状态未知'
+})
+
+const workingDir = computed(() => statusAvailable.value ? qwenpawInfo.value?.workingDir || '' : '')
+const workingDirShort = computed(() => {
+  const path = workingDir.value
+  if (!path) return '-'
+  if (qwenpawInfo.value?.workingDirDisplay) return qwenpawInfo.value.workingDirDisplay
+  const parts = path.split('/').filter(Boolean)
+  return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : path
+})
+
+const copyWorkingDir = async () => {
+  try {
+    if (!workingDir.value || !navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+    await navigator.clipboard.writeText(workingDir.value)
+    showNotification('完整路径已复制', 'success')
+  } catch {
+    showNotification('无法自动复制，请选择完整路径后手动复制', 'warning')
+  }
+}
 
 const runtimeText = computed(() => {
   const startAt = qwenpawInfo.value?.startAt
@@ -57,7 +88,13 @@ const runtimeText = computed(() => {
 
 const qwenpawUrl = computed(() => {
   if (typeof window !== 'undefined') {
-    return `http://${window.location.hostname}:19091`
+    const url = new URL(window.location.href)
+    url.protocol = 'http:'
+    url.port = String(qwenpawInfo.value?.port || 19091)
+    url.pathname = '/'
+    url.search = ''
+    url.hash = ''
+    return url.toString()
   }
   return 'http://localhost:19091'
 })
@@ -250,12 +287,15 @@ const refreshStatus = async () => {
     const result = await res.json()
     if (result.success) {
       qwenpawInfo.value = result
+      statusAvailable.value = true
       running.value = result.running || false
       version.value = result.version || ''
     } else {
+      statusAvailable.value = false
       running.value = false
     }
   } catch {
+    statusAvailable.value = false
     running.value = false
   }
 }
@@ -265,10 +305,12 @@ onMounted(() => {
   runtimeTimer = window.setInterval(() => {
     now.value = Date.now()
   }, 1000)
+  statusTimer = window.setInterval(refreshStatus, 15000)
 })
 
 onUnmounted(() => {
   if (runtimeTimer) window.clearInterval(runtimeTimer)
+  if (statusTimer) window.clearInterval(statusTimer)
   if (upgradePollTimer) window.clearInterval(upgradePollTimer)
 })
 </script>
@@ -327,7 +369,7 @@ onUnmounted(() => {
                 size="md"
                 class="px-2 py-0.5"
               >
-                {{ running ? 'Active' : 'Stopped' }}
+                {{ statusText }}
               </UBadge>
             </div>
             <p class="text-[var(--ui-text-muted)] text-base">
@@ -380,101 +422,90 @@ onUnmounted(() => {
       </div>
     </UCard>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-[1.15fr_1fr]">
       <UCard
         class="bg-[var(--ui-bg-card)] shadow-sm"
         :ui="{ root: 'ring-0 divide-y-0', body: '!p-0 !px-6 !pb-6' }"
       >
         <template #header>
-          <div class="flex items-center gap-2">
-            <UIcon name="i-lucide-zap" class="w-5 h-5 text-primary" />
-            <span class="font-semibold text-[var(--ui-text)]">快速操作</span>
+          <div>
+            <div class="flex items-center gap-2">
+              <UIcon name="i-lucide-zap" class="w-5 h-5 text-primary" />
+              <h2 class="font-semibold text-[var(--ui-text)]">快速操作</h2>
+            </div>
+            <p class="mt-1 text-xs text-[var(--ui-text-muted)]">打开应用或管理常用功能</p>
           </div>
         </template>
-        <div class="space-y-3">
-          <div class="flex items-center justify-between p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="flex items-center gap-3">
-              <div class="w-9 h-9 rounded-lg bg-success/10 flex items-center justify-center">
-                <UIcon name="i-lucide-arrow-up-circle" class="w-5 h-5 text-success" />
-              </div>
-              <div>
-                <div class="text-sm font-medium text-[var(--ui-text)]">升级 QwenPaw</div>
-                <div class="text-xs text-[var(--ui-text-muted)]">更新到最新版本</div>
-              </div>
-            </div>
-            <UButton
-              color="success"
-              variant="outline"
-              size="xs"
-              icon="i-lucide-arrow-up-circle"
-              :loading="isUpgrading"
-              @click="showDisclaimer = true"
-            >
-              升级
-            </UButton>
-          </div>
-          <div class="flex items-center justify-between p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="flex items-center gap-3">
-              <div class="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center">
-                <UIcon name="i-lucide-globe" class="w-5 h-5 text-primary" />
-              </div>
-              <div>
-                <div class="text-sm font-medium text-[var(--ui-text)]">打开 QwenPaw</div>
-                <div class="text-xs text-[var(--ui-text-muted)]">访问 QwenPaw Web 界面</div>
-              </div>
-            </div>
-            <UButton
-              color="primary"
-              variant="outline"
-              size="xs"
-              icon="i-lucide-external-link"
-              :to="qwenpawUrl"
-              target="_blank"
-              :disabled="!running"
-            >
-              打开
-            </UButton>
-          </div>
-          <div class="flex items-center justify-between p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="flex items-center gap-3">
-              <div class="w-9 h-9 rounded-lg bg-info/10 flex items-center justify-center">
-                <UIcon name="i-lucide-file-text" class="w-5 h-5 text-info" />
-              </div>
-              <div>
-                <div class="text-sm font-medium text-[var(--ui-text)]">查看日志</div>
-                <div class="text-xs text-[var(--ui-text-muted)]">查看服务运行日志</div>
-              </div>
-            </div>
-            <UButton
-              color="neutral"
-              variant="outline"
-              size="xs"
-              icon="i-lucide-arrow-right"
-              to="/logs"
-            >
-              查看
-            </UButton>
-          </div>
-          <div class="flex items-center justify-between p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="flex items-center gap-3">
-              <div class="w-9 h-9 rounded-lg bg-warning/10 flex items-center justify-center">
-                <UIcon name="i-lucide-key-round" class="w-5 h-5 text-warning" />
-              </div>
-              <div>
-                <div class="text-sm font-medium text-[var(--ui-text)]">重置密码</div>
-                <div class="text-xs text-[var(--ui-text-muted)]">重新设置账号密码</div>
-              </div>
-            </div>
-            <UButton
-              color="warning"
-              variant="outline"
-              size="xs"
-              icon="i-lucide-rotate-ccw"
-              @click="showResetConfirm = true"
-            >
-              重置
-            </UButton>
-          </div>
+        <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <UButton
+            class="w-full justify-start gap-3 rounded-lg bg-primary/10 p-3 text-left sm:col-span-2"
+            color="primary"
+            variant="ghost"
+            :to="qwenpawUrl"
+            target="_blank"
+            :disabled="!running"
+          >
+            <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <UIcon name="i-lucide-globe" class="h-5 w-5" />
+            </span>
+            <span class="min-w-0 flex-1">
+              <span class="block text-sm font-semibold text-[var(--ui-text)]">打开 QwenPaw</span>
+              <span class="mt-0.5 block text-xs font-normal text-[var(--ui-text-muted)]">
+                {{ running ? '在新窗口访问应用' : '服务运行后可打开应用' }}
+              </span>
+            </span>
+            <UIcon name="i-lucide-external-link" class="h-4 w-4 shrink-0 text-primary" />
+          </UButton>
+
+          <UButton
+            class="w-full justify-start gap-3 rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3 text-left"
+            color="neutral"
+            variant="ghost"
+            to="/logs"
+          >
+            <UIcon name="i-lucide-file-text" class="h-5 w-5 shrink-0 text-primary" />
+            <span class="min-w-0">
+              <span class="block text-sm font-medium text-[var(--ui-text)]">查看日志</span>
+              <span class="mt-0.5 block text-xs font-normal text-[var(--ui-text-muted)]">运行与升级记录</span>
+            </span>
+          </UButton>
+          <UButton
+            class="w-full justify-start gap-3 rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3 text-left"
+            color="neutral"
+            variant="ghost"
+            to="/files"
+          >
+            <UIcon name="i-lucide-folder-key" class="h-5 w-5 shrink-0 text-primary" />
+            <span class="min-w-0">
+              <span class="block text-sm font-medium text-[var(--ui-text)]">目录授权</span>
+              <span class="mt-0.5 block text-xs font-normal text-[var(--ui-text-muted)]">管理可访问目录</span>
+            </span>
+          </UButton>
+          <UButton
+            class="w-full justify-start gap-3 rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3 text-left"
+            color="neutral"
+            variant="ghost"
+            :loading="isUpgrading"
+            @click="showDisclaimer = true"
+          >
+            <UIcon name="i-lucide-arrow-up-circle" class="h-5 w-5 shrink-0 text-success" />
+            <span class="min-w-0">
+              <span class="block text-sm font-medium text-[var(--ui-text)]">升级 QwenPaw</span>
+              <span class="mt-0.5 block text-xs font-normal text-[var(--ui-text-muted)]">更新应用版本</span>
+            </span>
+          </UButton>
+          <UButton
+            class="w-full justify-start gap-3 rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3 text-left"
+            color="neutral"
+            variant="ghost"
+            @click="showResetConfirm = true"
+          >
+            <UIcon name="i-lucide-key-round" class="h-5 w-5 shrink-0 text-warning" />
+            <span class="min-w-0">
+              <span class="block text-sm font-medium text-[var(--ui-text)]">重置密码</span>
+              <span class="mt-0.5 block text-xs font-normal text-[var(--ui-text-muted)]">重新设置登录账号</span>
+            </span>
+          </UButton>
         </div>
       </UCard>
 
@@ -483,57 +514,57 @@ onUnmounted(() => {
         :ui="{ root: 'ring-0 divide-y-0', body: '!p-0 !px-6 !pb-6' }"
       >
         <template #header>
-          <div class="flex items-center gap-2">
-            <UIcon name="i-lucide-server" class="w-5 h-5 text-info" />
-            <span class="font-semibold text-[var(--ui-text)]">服务信息</span>
+          <div>
+            <div class="flex items-center gap-2">
+              <UIcon name="i-lucide-server" class="w-5 h-5 text-info" />
+              <h2 class="font-semibold text-[var(--ui-text)]">服务信息</h2>
+            </div>
+            <p class="mt-1 text-xs text-[var(--ui-text-muted)]">查看当前服务配置</p>
           </div>
         </template>
-        <div class="space-y-3">
-          <div class="flex items-center gap-3 p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="w-9 h-9 rounded-lg bg-emerald-500/10 flex items-center justify-center shrink-0">
-              <UIcon name="i-lucide-radio" class="w-5 h-5 text-emerald-500" />
+        <div class="space-y-2">
+          <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <div class="rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3">
+              <div class="flex items-center gap-2 text-xs text-[var(--ui-text-muted)]">
+                <UIcon name="i-lucide-radio" class="h-4 w-4" />
+                <span>服务端口</span>
+              </div>
+              <div class="mt-2 text-sm font-semibold text-[var(--ui-text)]">
+                {{ statusAvailable ? qwenpawInfo?.port || '-' : '-' }}
+              </div>
             </div>
-            <div class="min-w-0">
-              <div class="text-xs text-[var(--ui-text-muted)]">服务端口</div>
-              <div class="text-sm font-mono font-medium text-[var(--ui-text)]">19091</div>
-            </div>
-          </div>
-          <div class="flex items-center gap-3 p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="w-9 h-9 rounded-lg bg-violet-500/10 flex items-center justify-center shrink-0">
-              <UIcon name="i-lucide-folder" class="w-5 h-5 text-violet-500" />
-            </div>
-            <div class="min-w-0">
-              <div class="text-xs text-[var(--ui-text-muted)]">工作目录</div>
-              <div class="text-sm font-mono font-medium text-[var(--ui-text)] truncate">
-                应用文件/com.dustinky.qwenpaw
+            <div class="rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3">
+              <div class="flex items-center gap-2 text-xs text-[var(--ui-text-muted)]">
+                <UIcon name="i-lucide-shield" class="h-4 w-4" />
+                <span>认证状态</span>
+              </div>
+              <div class="mt-2 text-sm font-semibold text-[var(--ui-text)]">
+                {{ authText }}
               </div>
             </div>
           </div>
-          <div class="flex items-center gap-3 p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="w-9 h-9 rounded-lg bg-orange-500/10 flex items-center justify-center shrink-0">
-              <UIcon name="i-lucide-shield" class="w-5 h-5 text-orange-500" />
+          <div class="rounded-lg bg-[var(--ui-bg-elevated)]/50 p-3">
+            <div class="flex items-center gap-2 text-xs text-[var(--ui-text-muted)]">
+              <UIcon name="i-lucide-folder" class="h-4 w-4" />
+              <span>工作目录</span>
             </div>
-            <div class="min-w-0">
-              <div class="text-xs text-[var(--ui-text-muted)]">认证状态</div>
-              <div class="flex items-center gap-2">
-                <span class="text-sm font-medium text-[var(--ui-text)]">{{ authEnabled ? '已启用' : '未启用' }}</span>
-                <span
-                  class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium"
-                  :class="authEnabled ? 'bg-emerald-500/10 text-emerald-600' : 'bg-slate-500/10 text-slate-500'"
-                >
-                  {{ authEnabled ? '安全' : '未认证' }}
-                </span>
+            <div class="mt-2 text-sm font-medium text-[var(--ui-text)] break-all" :title="workingDir">
+              {{ workingDirShort }}
+            </div>
+            <details v-if="workingDir" class="mt-2">
+              <summary class="cursor-pointer text-xs text-primary">查看完整路径</summary>
+              <div class="mt-2 flex items-start gap-2">
+                <code class="min-w-0 flex-1 select-all break-all text-xs text-[var(--ui-text-muted)]">{{ workingDir }}</code>
+                <UButton
+                  color="neutral"
+                  variant="ghost"
+                  size="xs"
+                  icon="i-lucide-copy"
+                  aria-label="复制完整工作目录路径"
+                  @click="copyWorkingDir"
+                />
               </div>
-            </div>
-          </div>
-          <div class="flex items-center gap-3 p-3 rounded-lg bg-[var(--ui-bg-elevated)]/50">
-            <div class="w-9 h-9 rounded-lg bg-blue-500/10 flex items-center justify-center shrink-0">
-              <UIcon name="i-lucide-package" class="w-5 h-5 text-blue-500" />
-            </div>
-            <div class="min-w-0">
-              <div class="text-xs text-[var(--ui-text-muted)]">当前版本</div>
-              <div class="text-sm font-mono font-medium text-[var(--ui-text)]">{{ version || '-' }}</div>
-            </div>
+            </details>
           </div>
         </div>
       </UCard>

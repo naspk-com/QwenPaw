@@ -11,6 +11,9 @@ importers:
       '@nuxt/ui':
         specifier: ^4.5.1
         version: 4.5.1(@tiptap/extensions@3.20.0(@tiptap/core@3.20.0(@tiptap/pm@3.20.0))(@tiptap/pm@3.20.0))(@tiptap/y-tiptap@3.0.2(prosemirror-model@1.25.4)(prosemirror-state@1.4.4)(prosemirror-view@1.41.6)(y-protocols@1.0.7(yjs@13.6.29))(yjs@13.6.29))(embla-carousel@8.6.0)(qrcode@1.5.4)(tailwindcss@4.2.1)(typescript@5.9.3)(vite@7.3.1(@types/node@22.19.13)(jiti@2.6.1)(lightningcss@1.31.1)(yaml@2.8.2))(vue-router@5.0.4(@vue/compiler-sfc@3.5.29)(vue@3.5.29(typescript@5.9.3)))(vue@3.5.29(typescript@5.9.3))(yjs@13.6.29)
+      '@trimjs/web-app':
+        specifier: 0.6.0
+        version: 0.6.0
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
@@ -880,6 +883,9 @@ packages:
       prosemirror-view: ^1.9.10
       y-protocols: ^1.0.1
       yjs: ^13.5.38
+
+  '@trimjs/web-app@0.6.0':
+    resolution: {integrity: sha512-UFYw4p6L54iilhEWPGmk3GZ9wGkg1MTjODqqbbEaky96cKBPygliJaB/J4m6hYsQK3MF4zpWfduA9PsLAfo7aA==}
 
   '@types/esrecurse@4.3.1':
     resolution: {integrity: sha512-xJBAbDifo5hpffDBuHl0Y8ywswbiAp/Wi7Y/GtAgSlZyIABppyurxVueOPE8LUQOxdlgi6Zqce7uoEpqNTeiUw==}
@@ -3299,6 +3305,8 @@ snapshots:
       prosemirror-view: 1.41.6
       y-protocols: 1.0.7(yjs@13.6.29)
       yjs: 13.6.29
+
+  '@trimjs/web-app@0.6.0': {}
 
   '@types/esrecurse@4.3.1': {}
 

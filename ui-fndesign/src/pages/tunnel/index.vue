@@ -51,8 +51,11 @@ const checkTunnelInstalled = async () => {
   }
 }
 
-const refreshInstallStatus = () => {
-  checkTunnelInstalled()
+const refreshInstallStatus = async () => {
+  await checkTunnelInstalled()
+  if (tunnelInstalled.value) {
+    await Promise.all([fetchTunnelStatus(), fetchDomainStatus()])
+  }
 }
 
 // Tunnel 状态
@@ -326,6 +329,13 @@ onMounted(async () => {
           刷新
         </UButton>
       </div>
+
+    <UAlert
+      color="warning"
+      variant="subtle"
+      title="外网访问会暴露 QwenPaw 服务"
+      description="请先设置账号密码，并确认 Cloudflare Tunnel 的访问控制符合您的安全要求。"
+    />
 
     <!-- Tunnel 状态卡片 -->
     <UCard

@@ -1,39 +1,32 @@
 #!/bin/bash
 
-# 错误处理
-handle_error() {
-    local exit_code=$?
-    if [ "$exit_code" -eq 0 ]; then exit_code=1; fi
-    local msg="执行配置脚本出错 (Exit Code: $exit_code)"
-    if [ -n "${TRIM_TEMP_LOGFILE}" ]; then
-        echo "${msg}" >> "${TRIM_TEMP_LOGFILE}"
-    fi
-    exit 1
-}
-trap 'handle_error' ERR
+source "${TRIM_APPDEST}/qwenpaw/runtime.sh" || exit 1
+qwenpaw_setup || exit 1
+qwenpaw_save_log_level "${QWENPAW_LOG_LEVEL}" || exit 1
 
-# 配置更新后重启服务以生效
 PID_FILE="${TRIM_PKGVAR}/qwenpaw.pid"
-
-echo "正在重启 QwenPaw 服务以应用新配置..."
-
 if [ -f "${PID_FILE}" ]; then
-    pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill -TERM "${pid}"
-        # 等待进程结束
-        count=0
-        while kill -0 "${pid}" 2>/dev/null; do
-            if [ $count -ge 10 ]; then
-                break
+    IFS= read -r pid < "${PID_FILE}" || true
+    case "${pid:-}" in
+        ''|*[!0-9]*) qwenpaw_report_error "服务进程记录无效"; exit 1 ;;
+        *)
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -TERM "${pid}" || exit 1
+                count=0
+                while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 15 ]; do
+                    sleep 1
+                    count=$((count + 1))
+                done
+                if kill -0 "${pid}" 2>/dev/null; then
+                    qwenpaw_report_error "服务未停止，无法应用新配置"
+                    exit 1
+                fi
+                qwenpaw_exec >> "${TRIM_PKGVAR}/qwenpaw.log" 2>&1 &
+                printf '%s\n' "$!" > "${PID_FILE}"
             fi
-            sleep 1
-            count=$((count + 1))
-        done
-        kill -KILL "${pid}" 2>/dev/null
-    fi
-    rm -f "${PID_FILE}"
+            ;;
+    esac
 fi
 
-echo "配置已更新，服务将自动重启"
+echo "配置已更新"
 exit 0

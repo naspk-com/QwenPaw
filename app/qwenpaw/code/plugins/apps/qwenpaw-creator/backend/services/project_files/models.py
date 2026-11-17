@@ -31,7 +31,6 @@ from pydantic import (
     model_validator,
 )
 
-
 CURRENT_PROJECT_SCHEMA_VERSION = 9
 DEFAULT_TIMELINE_ID = "timeline:main"
 DEFAULT_TIMELINE_TICKS_PER_SECOND = 1_000
@@ -112,6 +111,8 @@ class ExecutionPreauthorization(StrictModel):
 
 
 class ProjectSettings(StrictModel):
+    production_stage: Literal["script", "media"] = "media"
+    script_approval_fingerprint: Sha256 | None = None
     aspect_ratio: str = "16:9"
     resolution: str = "720P"
     platform: str = ""
@@ -473,6 +474,12 @@ class VisualVariant(StrictModel):
     reference_asset_version_ids: list[EntityId] = Field(default_factory=list)
     reference_artifact_version_ids: list[EntityId] = Field(
         default_factory=list,
+        description=(
+            "参考图（ArtifactVersion id）。同一空间群/风格群的关联场景，"
+            "还接受跨实体风格锚点 visual:<entityId>:<variantId>：派发时"
+            "解析为该基准变体当前选中的图片；基准图未生成前本节点在工作图"
+            "中等待，因此可以在规划期就写好，无需等基准出图。"
+        ),
     )
     generated_artifact_version_ids: list[EntityId] = Field(
         default_factory=list,
@@ -484,6 +491,28 @@ class VisualVariant(StrictModel):
     # entity's continuity.
     derived_from_variant_id: EntityId | None = None
     consistency_tags: list[str] = Field(default_factory=list)
+
+
+VISUAL_ANCHOR_REF_PREFIX = "visual:"
+
+
+def visual_style_anchor(
+    entities: Any,
+    ref: str,
+) -> tuple[str, VisualVariant] | None:
+    """Resolve a style-anchor ref ``visual:<entityId>:<variantId>``.
+
+    Entity and variant ids may themselves contain colons, so the ref is
+    matched against constructed ids instead of being split apart. Returns
+    the owning entity id together with the variant.
+    """
+    if not ref.startswith(VISUAL_ANCHOR_REF_PREFIX):
+        return None
+    for entity_id, entity in entities.items.items():
+        for variant_id, variant in entity.variants.items.items():
+            if ref == f"{VISUAL_ANCHOR_REF_PREFIX}{entity_id}:{variant_id}":
+                return entity_id, variant
+    return None
 
 
 class CharacterVoice(StrictModel):
@@ -758,6 +787,8 @@ class R2VPromptSync(StrictModel):
     plan_fingerprint: Sha256
     storyboard_prompt_fingerprint: Sha256
     video_prompt_fingerprint: Sha256
+    storyboard_input_fingerprint: Sha256 | None = None
+    video_input_fingerprint: Sha256 | None = None
 
 
 class R2VCreation(StrictModel):
@@ -870,7 +901,7 @@ class S2VCreation(StrictModel):
 
 
 class EditCreation(StrictModel):
-    """Creative facts for one selected source range.
+    """Creative facts for one selected uploaded or generated media range.
 
     The exact source and range live in the Element's ``render_source``.  A
     multi-selection edit is represented by multiple Elements, never by a
@@ -1494,6 +1525,7 @@ class Project(StrictModel):
             "scene": set(),
             "prop": set(),
         }
+        anchor_edges: dict[str, list[str]] = {}
         for entity in self.visual.entities.items.values():
             visual_ids[entity.kind].add(entity.entity_id)
             _require_collection_identity(
@@ -1507,11 +1539,23 @@ class Project(StrictModel):
                     variant.reference_asset_version_ids,
                     "visual source",
                 )
-                _require_all(
-                    artifact_versions,
-                    variant.reference_artifact_version_ids,
-                    "visual artifact reference",
-                )
+                for ref in variant.reference_artifact_version_ids:
+                    anchor = visual_style_anchor(self.visual.entities, ref)
+                    if anchor is None:
+                        _require_key(
+                            artifact_versions,
+                            ref,
+                            "visual artifact reference",
+                        )
+                    elif anchor[1] is variant:
+                        raise ValueError(
+                            f"visual style anchor {ref} references itself",
+                        )
+                    else:
+                        anchor_edges.setdefault(
+                            f"visual:{entity.entity_id}:{variant.variant_id}",
+                            [],
+                        ).append(ref)
                 _require_all(
                     artifact_versions,
                     variant.generated_artifact_version_ids,
@@ -1568,6 +1612,7 @@ class Project(StrictModel):
                     entity.voice.sample_source_version_id,
                     "character voice sample version",
                 )
+        _reject_anchor_cycles(anchor_edges)
 
         _require_collection_identity(
             self.visual.cast_lineups,
@@ -1673,12 +1718,10 @@ class Project(StrictModel):
                 if not isinstance(
                     element.render_source,
                     SourceVersionRenderSource,
-                ) or isinstance(
-                    element.render_source,
-                    ArtifactVersionRenderSource,
                 ):
                     raise ValueError(
-                        "Edit Element render_source must select one source asset range",
+                        "Edit Element render_source must select one source "
+                        "or artifact version range",
                     )
                 if element.render_source.source_out_tick is None:
                     raise ValueError(
@@ -1816,7 +1859,7 @@ class Project(StrictModel):
                     element_timelines[element_id].ticks_per_second,
                 )
 
-        _validate_narration_voiced_overlap(self.timelines)
+        _validate_narration_overlap(self.timelines)
         _validate_render_source_cycles(elements)
         return self
 
@@ -1943,41 +1986,83 @@ def _require_key(mapping: dict[str, T], key: str, label: str) -> T:
         raise ValueError(f"{label} references missing id {key}") from exc
 
 
+def _reject_anchor_cycles(edges: dict[str, list[str]]) -> None:
+    """A style-anchor cycle gates every member forever: with no image on
+    either side, nothing dispatches and no repair queue names the deadlock,
+    so the commit itself must refuse it."""
+
+    state: dict[str, int] = {}  # 1 = on the current path, 2 = settled
+    for start in edges:
+        if state.get(start):
+            continue
+        stack: list[tuple[str, int]] = [(start, 0)]
+        path: list[str] = []
+        while stack:
+            node, index = stack.pop()
+            if index == 0:
+                state[node] = 1
+                path.append(node)
+            targets = edges.get(node, [])
+            if index < len(targets):
+                stack.append((node, index + 1))
+                nxt = targets[index]
+                mark = state.get(nxt)
+                if mark == 1:
+                    cycle = [*path[path.index(nxt) :], nxt]
+                    raise ValueError(
+                        "visual style anchors form a cycle: "
+                        + " -> ".join(cycle),
+                    )
+                if not mark:
+                    stack.append((nxt, 0))
+            else:
+                state[node] = 2
+                path.pop()
+
+
 def _require_all(mapping: dict[str, Any], keys: list[str], label: str) -> None:
     for key in keys:
         _require_key(mapping, key, label)
 
 
-def _validate_narration_voiced_overlap(
+def _validate_narration_overlap(
     timelines: EntityCollection[Timeline],
 ) -> None:
-    """Reject overlap with S2V's explicit driving voice.
+    """Reject narration that collides with S2V driving voice or itself.
 
-    R2V narrative is not a timed speech annotation. Its actual audio must be
-    assessed from the produced media, never inferred from retired plan rows.
+    Two collisions make a timeline speak over itself:
+
+    - narration over an S2V interval, where the generated video natively
+      voices that span (s2v driving voice);
+    - narration over another narration, i.e. two voices at once. This is the
+      "switched the voice but both play" defect: re-voicing a segment must
+      rebind the existing Element (or delete it), never stack a second
+      narration over the same span.
+
+    ``bgm``/``sfx`` are exempt — a music bed and layered effects run under
+    narration on purpose — and adjacent narration segments ([a,b) then
+    [b,c)) do not overlap on the half-open interval. R2V narrative is not a
+    timed speech annotation: its audio is assessed from the produced media,
+    never inferred from retired plan rows.
     """
 
     for timeline in timelines.items.values():
         voiced_spans: list[tuple[str, TimelineSpan]] = []
+        narration_spans: list[tuple[str, TimelineSpan]] = []
         for element_id, element in timeline.elements_by_id.items():
             if not element.enabled:
                 continue
             creation = element.creation
             if isinstance(creation, S2VCreation):
                 voiced_spans.append((element_id, element.span))
-                continue
-        if not voiced_spans:
-            continue
-        for element_id, element in timeline.elements_by_id.items():
-            creation = element.creation
-            if (
-                not element.enabled
-                or not isinstance(creation, AudioCreation)
-                or creation.role != "narration"
+            elif (
+                isinstance(creation, AudioCreation)
+                and creation.role == "narration"
             ):
-                continue
+                narration_spans.append((element_id, element.span))
+        for element_id, span in narration_spans:
             for voiced_id, voiced_span in voiced_spans:
-                if element.span.overlaps(voiced_span):
+                if span.overlaps(voiced_span):
                     raise ValueError(
                         f"narration audio {element_id} overlaps the voiced "
                         f"interval [{voiced_span.start_tick}, "
@@ -1985,6 +2070,17 @@ def _validate_narration_voiced_overlap(
                         "the generated video natively voices that interval "
                         "(s2v driving voice); move the narration "
                         "span or adjust the driving voice clip",
+                    )
+        for index, (element_id, span) in enumerate(narration_spans):
+            for other_id, other_span in narration_spans[index + 1 :]:
+                if span.overlaps(other_span):
+                    raise ValueError(
+                        f"narration audio {element_id} overlaps narration "
+                        f"{other_id} on [{span.start_tick}, "
+                        f"{span.end_tick}): two narration tracks speak at "
+                        "once (double voice); re-voice a segment by "
+                        "rebinding or deleting the original Element, not "
+                        "by adding a second narration",
                     )
 
 

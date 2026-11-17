@@ -29,6 +29,10 @@
             },
             {
                 "type": "tips",
+                "helpText": "安全提示：QwenPaw 的智能体和技能可能读取文件、执行命令和访问外部服务。请仅允许可信用户访问，限制频道访问范围并妥善保管密钥。继续安装表示已阅读并接受上游安全提示。<a target=\"_blank\" href=\"https://qwenpaw.agentscope.io/docs/security\">查看完整安全说明</a>。"
+            },
+            {
+                "type": "tips",
                 "helpText": "3. 更多使用问题请加入 QQ 群 <a href='https://qun.qq.com/universal-share/share?ac=1&authKey=eh3ZjF03sS5h3xycHBkJxllqsbpz0QJTTRMVjySNNDp4W3jtafZtnrRe9t%2BrHfmZ&busi_data=eyJncm91cENvZGUiOiIxMDkxMzQ4MTkyIiwidG9rZW4iOiJUM043MmdJbytIWTlndCtkaWgyV2pUQTgyeXh1YzVMR21SZGxEUjJuVHRjVW1WYTE3d3B1ODI4c28rSjdUQy9LIiwidWluIjoiODE1MjIzNTgifQ%3D%3D&data=zc5hDTqOp2xm6e7x-U_2Yl0KARi6A5uyvzlnyU6cfjAFK7qn4S8Zz5D9kvvSd9BlUXV7gKXlmPyfVQV2PA_IiQ&svctype=4&tempid=h5_group_info' target='_blank'>1091348192</a> 进行交流。"
             }
         ]
